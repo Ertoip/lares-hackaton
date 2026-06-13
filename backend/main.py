@@ -20,9 +20,16 @@ from pydantic import BaseModel
 
 from simulator import Simulator
 from events import EventScheduler
+from weather import WeatherService
+from ais import AISService
 
 sim = Simulator()
 scheduler = EventScheduler(sim)
+weather = WeatherService()
+ais = AISService()
+# Expose live providers to the simulator so they ride along in each snapshot.
+sim.weather = weather
+sim.ais = ais
 
 
 class ConnectionManager:
@@ -73,6 +80,8 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(_sim_loop()),
         asyncio.create_task(_broadcast_loop()),
+        asyncio.create_task(weather.run()),
+        asyncio.create_task(ais.run()),
     ]
     yield
     for t in tasks:
@@ -118,6 +127,16 @@ def get_vehicles():
 @app.get("/contacts")
 def get_contacts():
     return sim.contacts
+
+
+@app.get("/weather")
+def get_weather():
+    return weather.current or {"detail": "weather not yet available"}
+
+
+@app.get("/ais")
+def get_ais():
+    return {"enabled": ais.enabled, "vessels": ais.vessels()}
 
 
 @app.get("/estimate/{vehicle_id}")

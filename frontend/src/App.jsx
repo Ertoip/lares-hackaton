@@ -11,6 +11,7 @@ import {
 } from "react-leaflet";
 import L from "leaflet";
 
+
 const API = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/ws";
 const CENTER = [38.2, 15.5];
@@ -28,43 +29,72 @@ function statusColor(v) {
     case "lost_comms":
     case "bingo":
       return "#e74c3c"; // red
+
+
     default:
       return "#2ecc71";
   }
 }
 
+// Highlight colour used while a vehicle is awaiting a waypoint pick.
+const SELECT_COLOR = "#00e5ff";
+
 // --------------------------------------------------------------------- //
 // SVG marker icons per vehicle type
 // --------------------------------------------------------------------- //
-function vehicleIcon(v) {
-  const color = statusColor(v);
+function vehicleIcon(v, selected = false) {
+  // While picking a direction/waypoint, the selected vehicle turns cyan and
+  // gets a stroke + pulsing halo so it's obvious which one you're commanding.
+  const color = selected ? SELECT_COLOR : statusColor(v);
+  const stroke = selected ? "#00e5ff" : "#06222e";
+  const strokeWidth = selected ? 3 : 2;
   const heading = v.heading || 0;
   let shape;
 
   if (v.type === "UAV") {
     // triangle, rotated to heading
     shape = `<polygon points="14,2 26,26 2,26"
-      fill="${color}" stroke="#06222e" stroke-width="2"
+      fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
       transform="rotate(${heading} 14 14)"/>`;
   } else if (v.type === "USV") {
     // boat / hull shape, rotated to heading
     shape = `<path d="M14 2 L22 12 L20 26 L8 26 L6 12 Z"
-      fill="${color}" stroke="#06222e" stroke-width="2"
+      fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"
       transform="rotate(${heading} 14 14)"/>`;
   } else {
     // UUV — circle
     shape = `<circle cx="14" cy="14" r="11"
-      fill="${color}" stroke="#06222e" stroke-width="2"/>`;
+      fill="${color}" stroke="${stroke}" stroke-width="${strokeWidth}"/>`;
   }
 
+  const halo = selected
+    ? `<circle cx="14" cy="14" r="13" fill="none" stroke="#00e5ff"
+        stroke-width="1.5" opacity="0.8"/>`
+    : "";
+
   const html = `<svg width="28" height="28" viewBox="0 0 28 28"
-    xmlns="http://www.w3.org/2000/svg">${shape}</svg>`;
+    xmlns="http://www.w3.org/2000/svg">${halo}${shape}</svg>`;
 
   return L.divIcon({
     html,
-    className: "veh-icon",
+    className: selected ? "veh-icon selected" : "veh-icon",
     iconSize: [28, 28],
     iconAnchor: [14, 14],
+  });
+}
+
+// Real AIS traffic — a small grey vessel chevron rotated to its heading.
+function aisIcon(heading = 0) {
+  const html = `<svg width="22" height="22" viewBox="0 0 22 22"
+    xmlns="http://www.w3.org/2000/svg">
+    <path d="M11 2 L17 19 L11 15 L5 19 Z"
+      fill="#9aa7b0" stroke="#5b6770" stroke-width="1.5"
+      transform="rotate(${heading} 11 11)"/></svg>`;
+  return L.divIcon({
+    html,
+    className: "ais-icon",
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
   });
 }
 
@@ -113,6 +143,8 @@ function MapClickHandler({ active, onPick }) {
 export default function App() {
   const [vehicles, setVehicles] = useState([]);
   const [contacts, setContacts] = useState([]);
+  const [aisVessels, setAisVessels] = useState([]);
+  const [weather, setWeather] = useState(null);
   const [alerts, setAlerts] = useState([]);
   const [acked, setAcked] = useState(new Set());
   const [simTime, setSimTime] = useState(0);
@@ -138,6 +170,8 @@ export default function App() {
         const msg = JSON.parse(evt.data);
         setVehicles(msg.vehicles || []);
         setContacts(msg.contacts || []);
+        setAisVessels(msg.ais || []);
+        setWeather(msg.weather || null);
         setAlerts(msg.alerts || []);
         setSimTime(msg.sim_time_sec || 0);
       };
@@ -274,7 +308,12 @@ export default function App() {
             const pos =
               v.submerged && est ? [est.lat, est.lon] : [v.lat, v.lon];
             return (
-              <Marker key={v.id} position={pos} icon={vehicleIcon(v)}>
+              <Marker
+                key={v.id}
+                position={pos}
+                icon={vehicleIcon(v, assignMode === v.id)}
+                zIndexOffset={assignMode === v.id ? 1000 : 0}
+              >
                 <Tooltip direction="top" offset={[0, -14]}>
                   <div className="veh-tooltip">
                     <b>{v.id}</b> ({v.type})<br />
@@ -350,6 +389,27 @@ export default function App() {
               );
             })}
 
+          {/* Real AIS traffic (grey) */}
+          {aisVessels.map((s) => (
+            <Marker
+              key={`ais-${s.mmsi}`}
+              position={[s.lat, s.lon]}
+              icon={aisIcon(s.heading)}
+            >
+              <Tooltip direction="top" offset={[0, -10]}>
+                <div className="veh-tooltip">
+                  <b>{s.name}</b> (AIS)
+                  <br />
+                  MMSI: {s.mmsi}
+                  <br />
+                  Speed: {s.sog_knots} kn
+                  <br />
+                  Heading: {Math.round(s.heading)}°
+                </div>
+              </Tooltip>
+            </Marker>
+          ))}
+
           {/* Threat contacts */}
           {contacts.map((c) => (
             <Marker
@@ -377,6 +437,8 @@ export default function App() {
       <Sidebar
         vehicles={vehicles}
         alerts={visibleAlerts}
+        weather={weather}
+        aisCount={aisVessels.length}
         onAck={ackAlert}
         onSelect={(id) => setAssignMode(id)}
       />
@@ -387,7 +449,11 @@ export default function App() {
 // --------------------------------------------------------------------- //
 // Sidebar
 // --------------------------------------------------------------------- //
-function Sidebar({ vehicles, alerts, onAck, onSelect }) {
+function fmtNum(n, unit = "", digits = 1) {
+  return n == null ? "—" : `${Number(n).toFixed(digits)}${unit}`;
+}
+
+function Sidebar({ vehicles, alerts, weather, aisCount, onAck, onSelect }) {
   return (
     <div className="sidebar">
       <div className="sidebar-section">
@@ -438,7 +504,28 @@ function Sidebar({ vehicles, alerts, onAck, onSelect }) {
       </div>
 
       <div className="env-strip">
-        🌊 Sea state 3 — waves 1.2m
+        {weather && !weather.error ? (
+          <>
+            <div className="env-row">
+              🌊 Sea state {weather.sea_state} — {weather.sea_state_label}
+            </div>
+            <div className="env-row">
+              Waves {fmtNum(weather.wave_height_m, " m")} @{" "}
+              {fmtNum(weather.wave_period_s, " s")} ·{" "}
+              {Math.round(weather.wave_direction_deg ?? 0)}°
+            </div>
+            <div className="env-row">
+              💨 Wind {fmtNum(weather.wind_speed_kn, " kn")} ·{" "}
+              {Math.round(weather.wind_direction_deg ?? 0)}° · 🌡{" "}
+              {fmtNum(weather.air_temp_c, "°C")}
+            </div>
+            <div className="env-src">
+              Open-Meteo · AIS traffic: {aisCount}
+            </div>
+          </>
+        ) : (
+          <div className="env-row">🌊 Awaiting live conditions…</div>
+        )}
       </div>
     </div>
   );

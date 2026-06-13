@@ -1,2 +1,5 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+requests==2.34.2
+websockets==16.0
+global-land-mask==1.0.0

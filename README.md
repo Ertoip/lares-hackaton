@@ -11,11 +11,24 @@ Strait of Messina. Three wired-together components:
 3. **FastAPI server + WebSocket broadcast** (`backend/main.py`).
 4. **React + Leaflet map UI** (`frontend/src/App.jsx`).
 
+Live external data is layered on top of the simulation:
+
+- **Open-Meteo** (`backend/weather.py`) — real marine + atmospheric
+  conditions (wave height/period/direction, wind, air temp, Douglas sea
+  state) for the Strait, shown in the sidebar environment strip. Key-less.
+- **AISStream.io** (`backend/ais.py`) — real-world vessel traffic streamed
+  over WebSocket and drawn in grey on the map. Requires a free API key.
+- **Land/water masking** (`backend/geo.py`) — surface and subsurface
+  vehicles (USV/UUV) are kept on the water; they never drive onto land.
+
 ```
 .
 ├── backend/
 │   ├── simulator.py     # vehicle state + physics + dead reckoning
 │   ├── events.py        # SCENARIO_B timeline + scheduler
+│   ├── geo.py           # land/water mask (keeps water vehicles at sea)
+│   ├── weather.py       # Open-Meteo marine + weather poller
+│   ├── ais.py           # AISStream.io live vessel-traffic client
 │   ├── main.py          # FastAPI app, WebSocket, REST
 │   └── requirements.txt
 └── frontend/
@@ -44,6 +57,20 @@ python -m venv .venv
 # source .venv/bin/activate
 
 pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+### Optional: real AIS traffic
+
+The map shows real nearby vessels (grey chevrons) when an
+[AISStream.io](https://aisstream.io) API key is provided. Without it the
+feature stays dormant — everything else works unchanged.
+
+```bash
+# Windows PowerShell:
+$env:AISSTREAM_API_KEY = "your-key-here"
+# macOS/Linux:
+# export AISSTREAM_API_KEY=your-key-here
 uvicorn main:app --reload
 ```
 
@@ -76,12 +103,17 @@ Open <http://localhost:5173>.
 - When a UUV goes into **acoustic blackout**, the UI polls
   `/estimate/{id}` every 3s and draws a semi-transparent blue uncertainty
   circle that grows over time, labelled `In blackout — Xm Ys`.
-- **Assign a waypoint:** click a vehicle marker → *Assign Waypoint* (or click a
-  vehicle row in the sidebar), then click a point on the map. A dashed line is
-  drawn from the vehicle to the waypoint and it steers toward it. Press
-  **Esc** to cancel.
+- **Assign a waypoint / direction:** click a vehicle marker → *Assign
+  Waypoint* (or click a vehicle row in the sidebar). The selected vehicle
+  turns **cyan with a pulsing halo** so you can see which one you're
+  commanding; then click a point on the map. A dashed line is drawn from the
+  vehicle to the waypoint and it steers toward it. Press **Esc** to cancel.
+  (Waypoints dropped on land for water vehicles are snapped to the nearest sea
+  point.)
+- **Grey chevrons** are real AIS vessel traffic (when a key is configured).
 - The **right sidebar** shows the fleet list, an alert queue (max 3 cards,
-  each with an Acknowledge button), and the environment strip.
+  each with an Acknowledge button), and a live environment strip fed by
+  Open-Meteo (sea state, waves, wind, temperature).
 
 ## Scenario timeline (`SCENARIO_B`)
 
@@ -102,10 +134,12 @@ To watch the full timeline without waiting ~18 minutes, just use the manual
 |---|---|---|
 | GET | `/vehicles` | current state snapshot of all vehicles |
 | GET | `/contacts` | active threat contacts |
+| GET | `/weather` | latest Open-Meteo marine + atmospheric conditions |
+| GET | `/ais` | `{enabled, vessels}` — live AIS traffic |
 | GET | `/estimate/{vehicle_id}` | dead-reckoned position + uncertainty for a submerged UUV |
 | POST | `/inject/{event_type}` | manually fire an event by name |
 | POST | `/assign` | `{vehicle_id, task, lat, lon}` → update task / waypoint |
-| WS | `/ws` | broadcasts `{vehicles, contacts, alerts, sim_time_sec}` every 1s |
+| WS | `/ws` | broadcasts `{vehicles, contacts, ais, weather, alerts, sim_time_sec}` every 1s |
 
 `event_type` values: `acoustic_loss`, `threat_contact`, `sensor_failure`,
 `bingo_warning`, `sim_start`.

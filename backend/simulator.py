@@ -13,6 +13,11 @@ import math
 import random
 import time
 
+from geo import is_water, snap_to_water
+
+# Vehicle types that must stay on the water (surface + subsurface).
+WATER_TYPES = {"USV", "UUV"}
+
 # Update cadence per vehicle type (seconds between position updates).
 UPDATE_RATES = {
     "UAV": 0.5,
@@ -90,10 +95,16 @@ class Simulator:
         # Per-vehicle bookkeeping that is not part of the public state.
         self._last_update = {}
         self._dive_info = {}  # UUV id -> {lat, lon, heading, speed, dive_ts}
+        # Live data providers, attached by main.py (may stay None).
+        self.weather = None
+        self.ais = None
 
         now = time.time()
         for d in VEHICLE_DEFS:
             v = dict(d)
+            # Water vehicles seeded on land are nudged to the nearest sea cell.
+            if v["type"] in WATER_TYPES and not is_water(v["lat"], v["lon"]):
+                v["lat"], v["lon"] = snap_to_water(v["lat"], v["lon"])
             v["link_type"] = LINK_TYPES[v["type"]]
             v["link_quality"] = round(random.uniform(0.85, 1.0), 2)
             v["last_contact_ts"] = now
@@ -156,8 +167,17 @@ class Simulator:
         dlat += random.gauss(0, 0.00003)
         dlon += random.gauss(0, 0.00003)
 
-        v["lat"] = round(v["lat"] + dlat, 6)
-        v["lon"] = round(v["lon"] + dlon, 6)
+        new_lat = round(v["lat"] + dlat, 6)
+        new_lon = round(v["lon"] + dlon, 6)
+
+        # Water vehicles must not cross onto land: if the next step would beach
+        # them, hold position and turn back toward open water instead.
+        if v["type"] in WATER_TYPES and not is_water(new_lat, new_lon):
+            v["heading"] = (v["heading"] + 180 + random.uniform(-40, 40)) % 360
+            return
+
+        v["lat"] = new_lat
+        v["lon"] = new_lon
 
         # Keep vehicles loosely inside the operating box by bouncing.
         if not (38.05 <= v["lat"] <= 38.35):
@@ -260,6 +280,9 @@ class Simulator:
             return None
         v["current_task"] = task
         if lat is not None and lon is not None:
+            # A water vehicle can't reach a waypoint on land — snap it to sea.
+            if v["type"] in WATER_TYPES and not is_water(lat, lon):
+                lat, lon = snap_to_water(lat, lon)
             v["waypoint"] = {"lat": lat, "lon": lon}
         return v
 
@@ -280,6 +303,8 @@ class Simulator:
             "contacts": self.contacts,
             "alerts": self.alerts,
             "sim_time_sec": self.sim_time_sec,
+            "weather": self.weather.current if self.weather else None,
+            "ais": self.ais.vessels() if self.ais else [],
         }
 
     # ------------------------------------------------------------------ #
