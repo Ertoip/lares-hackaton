@@ -1,12 +1,20 @@
 """Synthetic telemetry generator for the maritime DSS prototype.
 
-Simulates 6 unmanned vehicles (2 UAV, 2 USV, 2 UUV) operating in the
-Strait of Messina. Each vehicle moves along its heading each tick with a
-little Gaussian position noise and a slow battery drain.
+Two states are kept for every vehicle:
 
-UUVs, when submerged, stop emitting position updates. Their position is
-dead-reckoned internally from the last known fix with a growing
-uncertainty radius (20 m at dive, +10 m per minute of blackout).
+  * **Ground truth** (`self.vehicles`) — the vehicle's real state. The
+    simulator advances this every tick. The operator never sees it directly.
+  * **Perceived / reconstruction** (`self.perceived`) — the picture the DSS
+    rebuilds purely from telemetry packets that actually arrive. Packets are
+    dropped, delayed and noised by the comms model (see comms.py), so the
+    perceived position dead-reckons forward from the last received fix and its
+    uncertainty σ grows the longer a vehicle stays silent.
+
+The gap between the two is the uncertainty the operator must see (decision
+class D4). A submerged UUV is just the extreme case: its acoustic link goes
+to near-total blackout, so perceived σ balloons until it surfaces.
+
+Fleet: 6 unmanned vehicles (2 UAV, 2 USV, 2 UUV) in the Dover Strait.
 """
 
 import math
@@ -14,11 +22,18 @@ import random
 import time
 
 from geo import is_water, snap_to_water
+from comms import (
+    CommsModel,
+    drop_probability,
+    base_sigma_m,
+    sigma_growth_m_per_min,
+    residual_bandwidth_kbps,
+)
 
 # Vehicle types that must stay on the water (surface + subsurface).
 WATER_TYPES = {"USV", "UUV"}
 
-# Update cadence per vehicle type (seconds between position updates).
+# Update cadence per vehicle type (seconds between telemetry transmissions).
 UPDATE_RATES = {
     "UAV": 0.5,
     "USV": 1.0,
@@ -32,8 +47,22 @@ LINK_TYPES = {
     "UUV": "acoustic",
 }
 
+# A perceived fix older than (factor x update rate) is flagged stale.
+STALE_FACTOR = 4
+
+# Operating depth (z, metres) by type. UAVs fly, USVs sit at the surface,
+# UUVs cruise submerged; `submerge()` takes a UUV deeper still.
+DEFAULT_Z = {"UAV": 150.0, "USV": 0.0, "UUV": -40.0}
+SUBMERGED_Z = -80.0
+
+PAYLOAD_DEFAULTS = {"UAV": "sensors_active", "USV": "sensors_active", "UUV": "survey_active"}
+
 # One nautical mile expressed in degrees of latitude.
 NM_PER_DEG_LAT = 60.0
+
+
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
 
 
 def _knots_to_deg_per_sec_lat(speed_knots: float) -> float:
@@ -85,16 +114,18 @@ VEHICLE_DEFS = [
 
 
 class Simulator:
-    """Holds and advances the state of the whole fleet."""
+    """Holds and advances ground truth + the operator's perceived picture."""
 
-    def __init__(self):
+    def __init__(self, comms: CommsModel | None = None):
         self.start_time = time.time()
-        self.vehicles = {}
-        self.contacts = []   # threat contacts
-        self.alerts = []     # recent alert records broadcast to the UI
+        self.comms = comms or CommsModel()
+        self.vehicles = {}        # ground truth
+        self.perceived = {}       # operator's reconstruction
+        self.contacts = []        # threat contacts
+        self.alerts = []          # recent alert records broadcast to the UI
         # Per-vehicle bookkeeping that is not part of the public state.
-        self._last_update = {}
-        self._dive_info = {}  # UUV id -> {lat, lon, heading, speed, dive_ts}
+        self._last_update = {}    # last transmission-attempt time
+        self._inflight = {}       # vid -> list of in-transit packets (delay)
         # Live data providers, attached by main.py (may stay None).
         self.weather = None
         self.ais = None
@@ -105,14 +136,20 @@ class Simulator:
             # Water vehicles seeded on land are nudged to the nearest sea cell.
             if v["type"] in WATER_TYPES and not is_water(v["lat"], v["lon"]):
                 v["lat"], v["lon"] = snap_to_water(v["lat"], v["lon"])
+            v["z_m"] = DEFAULT_Z[v["type"]]
             v["link_type"] = LINK_TYPES[v["type"]]
             v["link_quality"] = round(random.uniform(0.85, 1.0), 2)
             v["last_contact_ts"] = now
             v["status"] = "nominal"
             v["submerged"] = False
             v["waypoint"] = None  # {"lat":..., "lon":...} when assigned
+            v["sensor_health"] = {cap: 1.0 for cap in v["capabilities"]}
+            v["payload_state"] = PAYLOAD_DEFAULTS[v["type"]]
+            self._update_velocity(v)
             self.vehicles[v["id"]] = v
             self._last_update[v["id"]] = now
+            self._inflight[v["id"]] = []
+            self._init_perceived(v, now)
 
     # ------------------------------------------------------------------ #
     # Time helpers
@@ -121,33 +158,49 @@ class Simulator:
     def sim_time_sec(self) -> int:
         return int(time.time() - self.start_time)
 
+    def _sea_state(self):
+        """Current Douglas sea state from live weather, or None (-> default)."""
+        if self.weather and self.weather.current:
+            cur = self.weather.current
+            if "error" not in cur:
+                return cur.get("sea_state")
+        return None
+
     # ------------------------------------------------------------------ #
     # Core tick
     # ------------------------------------------------------------------ #
     def tick(self):
-        """Advance every vehicle that is due for an update."""
+        """Advance ground truth, transmit telemetry, refresh perceived state."""
         now = time.time()
+        sea = self._sea_state()
+
         for vid, v in self.vehicles.items():
-            rate = UPDATE_RATES[v["type"]]
             elapsed = now - self._last_update[vid]
-            if elapsed < rate:
+            if elapsed < UPDATE_RATES[v["type"]]:
                 continue
 
-            # Submerged UUVs go silent: no public position update, no
-            # contact timestamp refresh. Their estimate is dead-reckoned
-            # on demand via estimate_position().
-            if v.get("submerged"):
-                self._last_update[vid] = now
-                continue
-
+            # Ground truth always advances — even submerged, the real vehicle
+            # keeps moving; it just stops being heard from.
             self._move(v, elapsed)
             self._drain_battery(v, elapsed)
-            v["last_contact_ts"] = now
+            self._update_velocity(v)
+            self._update_link_quality(v, sea)
             self._last_update[vid] = now
 
-            # Auto-mark bingo if battery is critically low.
+            # Auto-mark bingo if battery is critically low (truth-side).
             if v["battery_pct"] <= 15 and v["status"] == "nominal":
                 v["status"] = "bingo"
+
+            # Attempt to transmit telemetry; the comms model may drop it.
+            pkt = self.comms.transmit(v, sea_state=sea, now=now)
+            if pkt is not None:
+                self._inflight[vid].append(pkt)
+
+        # Deliver any in-flight packets whose latency has elapsed, then
+        # refresh every vehicle's perceived estimate (dead-reckon + grow σ).
+        self._deliver_packets(now)
+        for vid in self.vehicles:
+            self._update_perceived_estimate(vid, now)
 
     def _move(self, v, elapsed):
         # Steer gently toward an assigned waypoint, if any.
@@ -163,7 +216,7 @@ class Simulator:
         coslat = max(0.1, math.cos(math.radians(v["lat"])))
         dlon = (step_lat * math.sin(hdg)) / coslat
 
-        # Small Gaussian position noise.
+        # Small Gaussian position noise (true-state process noise).
         dlat += random.gauss(0, 0.00003)
         dlon += random.gauss(0, 0.00003)
 
@@ -195,60 +248,162 @@ class Simulator:
         rate = 0.02 if v["type"] == "UAV" else 0.008
         v["battery_pct"] = round(max(0.0, v["battery_pct"] - rate * elapsed), 1)
 
+    def _update_velocity(self, v):
+        """Cartesian velocity vector (knots) from speed + heading (0 = North)."""
+        hdg = math.radians(v["heading"])
+        spd = v["speed_knots"]
+        v["velocity"] = {
+            "vx_kn": round(spd * math.sin(hdg), 3),   # east
+            "vy_kn": round(spd * math.cos(hdg), 3),   # north
+        }
+
+    def _update_link_quality(self, v, sea):
+        """Evolve the true link quality as a bounded random walk toward the
+        level implied by current conditions (a link-quality time series)."""
+        implied = 1.0 - drop_probability(
+            v["link_type"], sea if sea is not None else 3,
+            v.get("z_m", 0.0), v.get("submerged", False),
+        )
+        q = v["link_quality"] + (implied - v["link_quality"]) * 0.2 + random.gauss(0, 0.02)
+        v["link_quality"] = round(_clamp(q, 0.0, 1.0), 2)
+
     # ------------------------------------------------------------------ #
-    # Dead reckoning for submerged UUVs
+    # Perceived-state reconstruction
+    # ------------------------------------------------------------------ #
+    def _init_perceived(self, v, now):
+        """Seed perceived state from a fresh ground-truth fix at startup."""
+        self.perceived[v["id"]] = {
+            "id": v["id"], "type": v["type"], "link_type": v["link_type"],
+            # last received fix (truth at t0)
+            "recv_lat": v["lat"], "recv_lon": v["lon"], "recv_z_m": v["z_m"],
+            "recv_heading": v["heading"], "recv_speed_knots": v["speed_knots"],
+            "recv_ts": now,
+            # last received scalar state
+            "z_m": v["z_m"], "battery_pct": v["battery_pct"], "status": v["status"],
+            "submerged": v["submerged"], "capabilities": list(v["capabilities"]),
+            "sensor_health": dict(v["sensor_health"]), "payload_state": v["payload_state"],
+            "link_quality": v["link_quality"], "current_task": v["current_task"],
+            "waypoint": v["waypoint"],
+        }
+        self._update_perceived_estimate(v["id"], now)
+
+    def _deliver_packets(self, now):
+        """Apply in-flight packets whose latency has elapsed (latest fix wins)."""
+        for vid, queue in self._inflight.items():
+            arrived = [pk for pk in queue if pk["arrive_ts"] <= now]
+            if not arrived:
+                continue
+            self._inflight[vid] = [pk for pk in queue if pk["arrive_ts"] > now]
+            latest = max(arrived, key=lambda pk: pk["sent_ts"])
+            self._apply_packet(vid, latest)
+
+    def _apply_packet(self, vid, pkt):
+        p = self.perceived[vid]
+        f = pkt["fields"]
+        p["recv_lat"] = f["lat"]
+        p["recv_lon"] = f["lon"]
+        p["recv_z_m"] = f["z_m"]
+        p["recv_heading"] = f["heading"]
+        p["recv_speed_knots"] = f["speed_knots"]
+        p["recv_ts"] = pkt["sent_ts"]
+        # Last received scalar state.
+        p["z_m"] = f["z_m"]
+        p["battery_pct"] = f["battery_pct"]
+        p["status"] = f["status"]
+        p["submerged"] = f["submerged"]
+        p["capabilities"] = f["capabilities"]
+        p["sensor_health"] = f["sensor_health"]
+        p["payload_state"] = f["payload_state"]
+        p["link_quality"] = f["link_quality"]
+        p["current_task"] = f["current_task"]
+        p["waypoint"] = f["waypoint"]
+
+    def _update_perceived_estimate(self, vid, now):
+        """Dead-reckon perceived position forward and grow uncertainty σ.
+
+        This is the single code path for *all* vehicles — a fresh UAV fix and a
+        long-submerged UUV blackout differ only in how stale the last fix is.
+        """
+        p = self.perceived[vid]
+        age = max(0.0, now - p["recv_ts"])
+
+        step_lat = _knots_to_deg_per_sec_lat(p["recv_speed_knots"]) * age
+        hdg = math.radians(p["recv_heading"])
+        dlat = step_lat * math.cos(hdg)
+        coslat = max(0.1, math.cos(math.radians(p["recv_lat"])))
+        dlon = (step_lat * math.sin(hdg)) / coslat
+
+        p["lat"] = round(p["recv_lat"] + dlat, 6)
+        p["lon"] = round(p["recv_lon"] + dlon, 6)
+        p["heading"] = p["recv_heading"]
+        p["velocity"] = {
+            "vx_kn": round(p["recv_speed_knots"] * math.sin(hdg), 3),
+            "vy_kn": round(p["recv_speed_knots"] * math.cos(hdg), 3),
+        }
+
+        link = p["link_type"]
+        sigma = base_sigma_m(link) + sigma_growth_m_per_min(link) * (age / 60.0)
+        p["sigma_m"] = round(sigma, 1)
+        p["age_sec"] = round(age, 1)
+        p["last_contact_ts"] = p["recv_ts"]
+        p["stale"] = age > STALE_FACTOR * UPDATE_RATES[p["type"]]
+        # The operator can't see a "submerged" bit during blackout — they infer
+        # loss of contact from staleness. This is what drives the UI cone.
+        p["in_blackout"] = p["stale"]
+        p["residual_bandwidth_kbps"] = residual_bandwidth_kbps(
+            link, p.get("link_quality") or 0.0
+        )
+        # Rough ETA to the next packet; unknown while in acoustic blackout.
+        if p.get("submerged"):
+            p["expected_next_contact_sec"] = None
+        else:
+            p["expected_next_contact_sec"] = round(
+                max(0.0, UPDATE_RATES[p["type"]] - age), 1
+            )
+
+    # ------------------------------------------------------------------ #
+    # Submerge / surface (acoustic blackout is just an extreme of comms)
     # ------------------------------------------------------------------ #
     def submerge(self, vid: str):
         v = self.vehicles.get(vid)
         if not v:
             return
         v["submerged"] = True
-        v["status"] = "lost_comms" if v["status"] == "nominal" else v["status"]
-        self._dive_info[vid] = {
-            "lat": v["lat"], "lon": v["lon"],
-            "heading": v["heading"], "speed_knots": v["speed_knots"],
-            "dive_ts": time.time(),
-        }
+        v["z_m"] = SUBMERGED_Z
+        if v["status"] == "nominal":
+            v["status"] = "lost_comms"
 
     def surface(self, vid: str):
         v = self.vehicles.get(vid)
         if not v:
             return
-        est = self.estimate_position(vid)
-        if est:
-            v["lat"], v["lon"] = est["lat"], est["lon"]
         v["submerged"] = False
+        v["z_m"] = DEFAULT_Z[v["type"]]
         v["status"] = "nominal"
         v["last_contact_ts"] = time.time()
-        self._dive_info.pop(vid, None)
 
     def estimate_position(self, vid: str):
-        """Return dead-reckoned position + uncertainty for a submerged UUV."""
-        v = self.vehicles.get(vid)
-        if not v or not v.get("submerged"):
-            return None
-        info = self._dive_info.get(vid)
-        if not info:
-            return None
+        """Return the perceived position + uncertainty for any vehicle.
 
-        blackout = time.time() - info["dive_ts"]
-        step_lat = _knots_to_deg_per_sec_lat(info["speed_knots"]) * blackout
-        hdg = math.radians(info["heading"])
-        dlat = step_lat * math.cos(hdg)
-        coslat = max(0.1, math.cos(math.radians(info["lat"])))
-        dlon = (step_lat * math.sin(hdg)) / coslat
-
-        uncertainty = 20.0 + 10.0 * (blackout / 60.0)
+        Backs GET /estimate/{id}. Fields kept backward-compatible with the UI:
+        `uncertainty_radius_m` is the perceived σ, `blackout_duration_sec` is
+        the age of the last received fix.
+        """
+        p = self.perceived.get(vid)
+        if not p:
+            return None
         return {
             "vehicle_id": vid,
-            "lat": round(info["lat"] + dlat, 6),
-            "lon": round(info["lon"] + dlon, 6),
-            "uncertainty_radius_m": round(uncertainty, 1),
-            "blackout_duration_sec": round(blackout, 1),
+            "lat": p["lat"],
+            "lon": p["lon"],
+            "uncertainty_radius_m": p["sigma_m"],
+            "blackout_duration_sec": p["age_sec"],
+            "submerged": p.get("submerged", False),
+            "in_blackout": p.get("in_blackout", False),
         }
 
     # ------------------------------------------------------------------ #
-    # Mutators used by the event system / REST API
+    # Mutators used by the event system / REST API (act on GROUND TRUTH)
     # ------------------------------------------------------------------ #
     def add_contact(self, contact: dict):
         # Avoid duplicate ids.
@@ -261,6 +416,9 @@ class Simulator:
         v = self.vehicles.get(vid)
         if v and capability in v.get("capabilities", []):
             v["capabilities"].remove(capability)
+            # Degradation is visible in telemetry, not just the capability list.
+            if "sensor_health" in v:
+                v["sensor_health"][capability] = 0.0
             if v["status"] == "nominal":
                 v["status"] = "degraded"
 
@@ -299,7 +457,10 @@ class Simulator:
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
         return {
-            "vehicles": list(self.vehicles.values()),
+            # What the operator's DSS sees (reconstruction).
+            "vehicles": list(self.perceived.values()),
+            # The real state, for the truth-vs-reconstruction overlay / debug.
+            "ground_truth": list(self.vehicles.values()),
             "contacts": self.contacts,
             "alerts": self.alerts,
             "sim_time_sec": self.sim_time_sec,

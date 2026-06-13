@@ -18,13 +18,16 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from simulator import Simulator
+from perceived_sim import PerceivedSimulator
 from events import EventScheduler
 from weather import WeatherService
 from ais import AISService
 
-sim = Simulator()
-scheduler = EventScheduler(sim)
+# Active degradation scenario at startup ("A" or "B").
+ACTIVE_SCENARIO = "B"
+
+sim = PerceivedSimulator()
+scheduler = EventScheduler(sim, scenario=ACTIVE_SCENARIO)
 weather = WeatherService()
 ais = AISService()
 # Expose live providers to the simulator so they ride along in each snapshot.
@@ -121,7 +124,8 @@ async def websocket_endpoint(ws: WebSocket):
 # --------------------------------------------------------------------- #
 @app.get("/vehicles")
 def get_vehicles():
-    return list(sim.vehicles.values())
+    """Perceived vehicle states — the only picture the DSS and UI ever see."""
+    return list(sim.perceived.values())
 
 
 @app.get("/contacts")
@@ -149,6 +153,13 @@ def get_estimate(vehicle_id: str):
             "detail": "Vehicle is not in acoustic blackout; live position available.",
         }
     return est
+
+
+@app.post("/scenario/{name}")
+def set_scenario(name: str):
+    if not scheduler.load_scenario(name):
+        return {"ok": False, "detail": f"Unknown scenario '{name}'"}
+    return {"ok": True, "scenario": name}
 
 
 @app.post("/inject/{event_type}")

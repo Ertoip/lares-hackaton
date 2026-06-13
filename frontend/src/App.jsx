@@ -37,7 +37,7 @@ function statusColor(v) {
 }
 
 // Highlight colour used while a vehicle is awaiting a waypoint pick.
-const SELECT_COLOR = "#00e5ff";
+const SELECT_COLOR = "#2f00ff";
 
 // --------------------------------------------------------------------- //
 // SVG marker icons per vehicle type
