@@ -14,7 +14,7 @@ import L from "leaflet";
 
 const API = "http://localhost:8000";
 const WS_URL = "ws://localhost:8000/ws";
-const CENTER = [38.2, 15.5];
+const CENTER = [51.05, 1.55];
 
 // --------------------------------------------------------------------- //
 // Status -> colour

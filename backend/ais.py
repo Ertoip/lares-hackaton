@@ -21,7 +21,7 @@ AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
 
 # Operating-area bounding box, matching the simulator's box.
 # AISStream wants [[ [lat_min, lon_min], [lat_max, lon_max] ]].
-BBOX = [[[38.05, 15.25], [38.35, 15.75]]]
+BBOX = [[[50.85, 0.90], [51.25, 2.20]]]
 
 STALE_SEC = 600         # drop vessels not heard from in 10 min
 RECONNECT_SEC = 10      # wait before reconnecting after a drop

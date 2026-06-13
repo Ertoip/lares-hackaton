@@ -20,8 +20,8 @@ MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # A point that is reliably on water inside the operating area.
-SAMPLE_LAT = 38.15
-SAMPLE_LON = 15.62
+SAMPLE_LAT = 51.05
+SAMPLE_LON = 1.55
 
 REFRESH_SEC = 600  # 10 minutes
 

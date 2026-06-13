@@ -17,7 +17,7 @@ SCENARIO_B = [
         "t_sec": 1320,
         "type": "threat_contact",
         "contact": {
-            "id": "TGT-01", "lat": 38.22, "lon": 15.55,
+            "id": "TGT-01", "lat": 51.06, "lon": 1.65,
             "speed_knots": 28, "heading": 210, "ais": False,
             "behavior": "hostile",
         },
@@ -111,7 +111,7 @@ class EventScheduler:
                 "type": "threat_contact",
                 "contact": {
                     "id": f"TGT-{int(time.time()) % 100:02d}",
-                    "lat": 38.19, "lon": 15.53, "speed_knots": 24,
+                    "lat": 51.03, "lon": 1.58, "speed_knots": 24,
                     "heading": 180, "ais": False, "behavior": "hostile",
                 },
             },

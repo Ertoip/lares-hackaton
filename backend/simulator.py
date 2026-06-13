@@ -42,41 +42,41 @@ def _knots_to_deg_per_sec_lat(speed_knots: float) -> float:
     return nm_per_sec / NM_PER_DEG_LAT
 
 
-# Initial fleet definition. All vehicles seeded inside the Strait of Messina
-# box (38.1-38.3 N, 15.3-15.7 E).
+# Initial fleet definition. All vehicles seeded inside the Dover Strait
+# box (50.85-51.25 N, 0.90-2.20 E).
 VEHICLE_DEFS = [
     {
-        "id": "UAV-1", "type": "UAV", "lat": 38.265, "lon": 15.41,
+        "id": "UAV-1", "type": "UAV", "lat": 51.12, "lon": 1.30,
         "heading": 120.0, "speed_knots": 60.0, "battery_pct": 78.0,
         "capabilities": ["visual_ISR", "thermal_ISR"],
         "current_task": "Wide-area ISR patrol",
     },
     {
-        "id": "UAV-2", "type": "UAV", "lat": 38.13, "lon": 15.62,
+        "id": "UAV-2", "type": "UAV", "lat": 50.95, "lon": 1.98,
         "heading": 300.0, "speed_knots": 55.0, "battery_pct": 91.0,
         "capabilities": ["visual_ISR", "comms_relay"],
         "current_task": "Comms relay orbit",
     },
     {
-        "id": "USV-1", "type": "USV", "lat": 38.21, "lon": 15.48,
+        "id": "USV-1", "type": "USV", "lat": 51.05, "lon": 1.45,
         "heading": 45.0, "speed_knots": 18.0, "battery_pct": 84.0,
         "capabilities": ["surface_radar", "active_sonar"],
         "current_task": "Picket line patrol",
     },
     {
-        "id": "USV-2", "type": "USV", "lat": 38.18, "lon": 15.58,
+        "id": "USV-2", "type": "USV", "lat": 51.02, "lon": 1.75,
         "heading": 210.0, "speed_knots": 14.0, "battery_pct": 88.0,
         "capabilities": ["surface_radar", "passive_sonar"],
         "current_task": "ASW screen",
     },
     {
-        "id": "UUV-1", "type": "UUV", "lat": 38.20, "lon": 15.52,
+        "id": "UUV-1", "type": "UUV", "lat": 51.08, "lon": 1.60,
         "heading": 90.0, "speed_knots": 4.0, "battery_pct": 73.0,
         "capabilities": ["passive_sonar", "seabed_mapping"],
         "current_task": "Subsurface survey",
     },
     {
-        "id": "UUV-2", "type": "UUV", "lat": 38.24, "lon": 15.50,
+        "id": "UUV-2", "type": "UUV", "lat": 51.00, "lon": 1.55,
         "heading": 270.0, "speed_knots": 3.5, "battery_pct": 66.0,
         "capabilities": ["passive_sonar", "mine_countermeasures"],
         "current_task": "MCM sweep",
@@ -180,12 +180,12 @@ class Simulator:
         v["lon"] = new_lon
 
         # Keep vehicles loosely inside the operating box by bouncing.
-        if not (38.05 <= v["lat"] <= 38.35):
+        if not (50.85 <= v["lat"] <= 51.25):
             v["heading"] = (v["heading"] + 180) % 360
-            v["lat"] = min(38.35, max(38.05, v["lat"]))
-        if not (15.25 <= v["lon"] <= 15.75):
+            v["lat"] = min(51.25, max(50.85, v["lat"]))
+        if not (0.90 <= v["lon"] <= 2.20):
             v["heading"] = (v["heading"] + 180) % 360
-            v["lon"] = min(15.75, max(15.25, v["lon"]))
+            v["lon"] = min(2.20, max(0.90, v["lon"]))
 
         # Tiny heading drift so tracks aren't perfectly straight.
         v["heading"] = (v["heading"] + random.gauss(0, 1.5)) % 360
