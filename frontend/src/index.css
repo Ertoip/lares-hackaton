@@ -1,0 +1,263 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+.map-wrap {
+  flex: 1;
+  position: relative;
+}
+
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  background: #0b1f2a;
+}
+
+/* ----- Sidebar ----- */
+.sidebar {
+  width: 300px;
+  min-width: 300px;
+  background: #0f1c24;
+  color: #d6e4ee;
+  display: flex;
+  flex-direction: column;
+  border-left: 2px solid #1d3340;
+  overflow: hidden;
+}
+
+.sidebar h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #6fb3d2;
+  margin: 0;
+  padding: 10px 14px 6px;
+  border-bottom: 1px solid #1d3340;
+}
+
+.sidebar-section {
+  border-bottom: 1px solid #1d3340;
+}
+
+.sidebar-header {
+  padding: 10px 14px;
+  background: #12222c;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #6fb3d2;
+}
+
+.vehicle-list {
+  overflow-y: auto;
+  max-height: 38vh;
+}
+
+.vehicle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 1px solid #15262f;
+}
+
+.vehicle-row:hover {
+  background: #15262f;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.vehicle-row .vid {
+  font-weight: 600;
+  width: 56px;
+}
+
+.vehicle-row .vmeta {
+  color: #8aa6b6;
+  font-size: 11px;
+  margin-left: auto;
+}
+
+/* ----- Alerts ----- */
+.alerts {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.alert-card {
+  background: #1a2c38;
+  border-left: 4px solid #e0a800;
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.alert-card.threat_contact {
+  border-left-color: #e23b3b;
+}
+.alert-card.bingo_warning {
+  border-left-color: #e23b3b;
+}
+.alert-card.acoustic_loss {
+  border-left-color: #8a8a8a;
+}
+
+.alert-card .atype {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-size: 11px;
+}
+
+.alert-card .amsg {
+  color: #c8d8e4;
+  margin: 3px 0 6px;
+}
+
+.alert-card .arow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.alert-card .ats {
+  color: #7e98a8;
+  font-size: 11px;
+}
+
+button.ack {
+  background: #2a4a5c;
+  color: #d6e4ee;
+  border: none;
+  border-radius: 3px;
+  padding: 3px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+button.ack:hover {
+  background: #36617a;
+}
+
+/* ----- Environment strip ----- */
+.env-strip {
+  padding: 10px 14px;
+  background: #12222c;
+  font-size: 12px;
+  color: #9fc3d6;
+  border-top: 1px solid #1d3340;
+}
+
+/* ----- Inject toolbar (demo controls) ----- */
+.inject-bar {
+  position: absolute;
+  top: 10px;
+  left: 50px;
+  z-index: 1000;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.inject-bar button {
+  background: rgba(18, 34, 44, 0.92);
+  color: #d6e4ee;
+  border: 1px solid #2a4a5c;
+  border-radius: 4px;
+  padding: 5px 9px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.inject-bar button:hover {
+  background: #1d3340;
+}
+
+.sim-clock {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  z-index: 1000;
+  background: rgba(15, 28, 36, 0.92);
+  color: #6fb3d2;
+  font-family: monospace;
+  font-size: 13px;
+  padding: 5px 10px;
+  border-radius: 4px;
+  border: 1px solid #2a4a5c;
+}
+
+.waypoint-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  background: #1f6feb;
+  color: #fff;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.conn-badge {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 1000;
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+.conn-badge.on {
+  background: #1d4d2b;
+  color: #7ee29a;
+}
+.conn-badge.off {
+  background: #4d1d1d;
+  color: #e27e7e;
+}
+
+/* Leaflet tooltip readability */
+.veh-tooltip {
+  font-size: 12px;
+  line-height: 1.4;
+}
+.veh-tooltip b {
+  color: #0b3a52;
+}
+
+.assign-btn {
+  background: #1f6feb;
+  color: #fff;
+  border: none;
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  margin-top: 4px;
+}
