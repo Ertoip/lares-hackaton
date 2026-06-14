@@ -22,12 +22,14 @@ from perceived_sim import PerceivedSimulator
 from events import EventScheduler
 from weather import WeatherService
 from ais import AISService
+from commands import CommandRequest, CommandDispatcher
 
 # Active degradation scenario at startup ("A" or "B").
 ACTIVE_SCENARIO = "B"
 
 sim = PerceivedSimulator()
 scheduler = EventScheduler(sim, scenario=ACTIVE_SCENARIO)
+dispatcher = CommandDispatcher(sim)
 weather = WeatherService()
 ais = AISService()
 # Expose live providers to the simulator so they ride along in each snapshot.
@@ -68,6 +70,7 @@ async def _sim_loop():
     while True:
         sim.tick()
         scheduler.step()
+        dispatcher.step()  # deliver any queued commands to now-reachable vehicles
         await asyncio.sleep(0.25)
 
 
@@ -162,6 +165,41 @@ def set_scenario(name: str):
     return {"ok": True, "scenario": name}
 
 
+def _advance(seconds: float) -> float:
+    """Step the clock forward in small increments, ticking the sim and the
+    scheduler each step so motion, uncertainty and scripted events all unfold
+    naturally — just compressed in real time."""
+    seconds = max(0.0, min(float(seconds), 3600.0))
+    step = 2.0
+    elapsed = 0.0
+    while elapsed < seconds:
+        dt = min(step, seconds - elapsed)
+        sim.clock_offset += dt
+        sim.tick()
+        scheduler.step()
+        dispatcher.step()  # deliver queued commands as contact windows open
+        elapsed += dt
+    return seconds
+
+
+# `async def` keeps the whole advance atomic on the event loop, so it can't
+# interleave with the background sim/broadcast tasks mid-jump.
+@app.post("/fast_forward/{seconds}")
+async def fast_forward(seconds: int):
+    advanced = _advance(seconds)
+    return {"ok": True, "advanced_sec": advanced, "sim_time_sec": sim.sim_time_sec}
+
+
+@app.post("/skip_to_next_event")
+async def skip_to_next_event():
+    t = scheduler.next_event_time()
+    if t is None:
+        return {"ok": False, "detail": "No more scheduled events to skip to."}
+    delta = max(1.0, t - sim.sim_time_sec + 1)
+    advanced = _advance(delta)
+    return {"ok": True, "advanced_sec": advanced, "sim_time_sec": sim.sim_time_sec}
+
+
 @app.post("/inject/{event_type}")
 def inject_event(event_type: str):
     desc = scheduler.fire_by_type(event_type)
@@ -188,6 +226,21 @@ def assign(req: AssignRequest):
         "current_task": v["current_task"],
         "waypoint": v["waypoint"],
     }
+
+
+@app.post("/command")
+def command(cmd: CommandRequest):
+    """Execute (or queue) a DSS decision. The teammate's DSS reaches this via the
+    bridge's reverse path; see README_dss_commands.md for the contract. Returns an
+    ack: status = executed | pending | rejected. ``pending`` means the vehicle is
+    out of contact and the order is queued until its next contact window."""
+    return dispatcher.submit(cmd)
+
+
+@app.get("/commands")
+def get_commands():
+    """Debug: recent command acks + how many commands are queued per vehicle."""
+    return dispatcher.status()
 
 
 @app.get("/")

@@ -105,6 +105,7 @@ the solver needs arrives in one JSON object, pushed over `ws://localhost:8000/ws
 | Key | Type | Meaning |
 |---|---|---|
 | `vehicles` | array&lt;Vehicle&gt; | perceived estimate for each of the 6 vehicles (below) |
+| `mothership` | Mothership | crewed command vessel — **known** position, no telemetry/uncertainty (below) |
 | `contacts` | array&lt;Contact&gt; | active threat contacts |
 | `alerts` | array&lt;Alert&gt; | recent alert records (last 10) |
 | `sim_time_sec` | int | seconds since simulation start |
@@ -147,6 +148,8 @@ explicit so the solver can consume them directly.
 | `payload_state` | str | — | e.g. `sensors_active`, `survey_active` |
 | `current_task` | str | — | human-readable current tasking |
 | `waypoint` | obj \| null | — | `{lat, lon}` if a destination is assigned |
+| `rtb` | bool | — | auto return-to-ship in progress (set on bingo; cleared on docking) |
+| `eta_to_ship_sec` | float \| null | s | ETA to the mothership while `rtb` (accounts for both velocities); `null` otherwise or if not closing |
 
 > Records also carry internal anchor fields (`fix_lat`, `fix_lon`,
 > `fix_heading`, `fix_speed_knots`, `fix_z_m`). **The solver should ignore
@@ -182,6 +185,29 @@ UUV is the extreme case. To draw or reason about it: ellipse centred at
 | Current commitment | `current_task`, `waypoint`, `velocity` |
 | Threats & environment | `contacts`, `weather` (sea state degrades comms & UUV/USV motion) |
 
+## Mothership object
+
+The crewed command vessel the fleet operates from. It is **not** an unmanned,
+comms-tracked vehicle: its position is simply known, so it carries no
+uncertainty, link, battery or status fields and never appears in `vehicles`. It
+steams slowly across the operating area (turning away from land and the box
+edge), kept **below the slowest UUV's speed** so a returning sub can always
+catch and dock with it. The DSS can treat it as a fixed-truth reference point.
+
+**Auto return-to-ship + recharge.** When a vehicle crosses its bingo threshold
+it sets `rtb=true` and steers to the mothership's *current* position (submerged
+UUVs surface first). On arrival within the dock radius it recharges to 100%,
+clears `rtb`, returns to `nominal`, and emits a `vehicle_docked` alert. This is
+an interim, sim-side autonomy; the DSS will later own the return decision.
+
+| Field | Type | Unit | Meaning |
+|---|---|---|---|
+| `id` | str | — | e.g. `CSV MERIDIAN` |
+| `type` | str | — | always `mothership` |
+| `lat`, `lon` | float | ° | known position |
+| `heading` | float | ° (0=N, CW) | course |
+| `speed_knots` | float | kn | speed |
+
 ## Contact object
 
 | Field | Type | Meaning |
@@ -208,6 +234,16 @@ source, updated_ts }`, or `{ error, source }` if the fetch failed.
 
 `{ type, vehicle, message, ts, sim_time_sec }`.
 
+Emitted `type` values: `sim_start`, `acoustic_loss`, `acoustic_regain`,
+`threat_contact`, `sensor_failure`, `prebingo_warning` (battery nearing bingo),
+`bingo_warning` (reached bingo — also fires organically, not just via inject),
+`vehicle_docked` (recharged at the mothership). A `prebingo_warning` for a
+vehicle is removed automatically once that vehicle hits `bingo_warning`.
+
+> The UI ranks active alerts and shows the top 3, collapsing the rest under an
+> expandable bar. Ranking is interim (by type); it prefers an optional
+> `priority` field if the DSS later supplies one, so no UI change is needed then.
+
 ---
 
 # REST API
@@ -221,6 +257,8 @@ source, updated_ts }`, or `{ error, source }` if the fetch failed.
 | GET | `/estimate/{vehicle_id}` | position + cone for one vehicle: `{lat, lon, uncertainty_radius_m, sigma_along_m, sigma_cross_m, uncertainty_heading_deg, blackout_duration_sec, submerged, in_blackout}` |
 | POST | `/scenario/{name}` | switch active scenario (`A` / `B`) and reset its timeline |
 | POST | `/inject/{event_type}` | manually fire an event by name |
+| POST | `/fast_forward/{seconds}` | advance the sim clock by N seconds (capped at 3600); motion, uncertainty and scheduled events all unfold, just compressed |
+| POST | `/skip_to_next_event` | fast-forward to just past the next un-fired scheduled event (or `{ok:false}` if none remain) |
 | POST | `/assign` | body `{vehicle_id, task, lat?, lon?}` → set task / waypoint |
 | WS | `/ws` | broadcasts the full snapshot every 1 s |
 
@@ -253,11 +291,23 @@ events on demand instead of waiting.
 
 - 6 vehicles on the map. **Triangle = UAV, boat = USV, circle = UUV.** Colour:
   green = nominal, yellow = degraded, red = lost_comms/bingo, grey = submerged.
-- **Inject** buttons (top-left) fire scenario events manually.
-- A silent/submerged vehicle draws a growing semi-transparent uncertainty
-  region (from `/estimate/{id}`), labelled `In blackout — Xm Ys`.
+  Hover a vehicle for its speed, heading, battery, link and estimated
+  uncertainty.
+- The big **gold pulsing star** is the mothership (crewed command vessel). When
+  a vehicle hits bingo it auto-returns to the ship (dashed line to the star),
+  recharges on contact, and resumes — watch it cycle under fast-forward.
+- **Inject** buttons (top-left) fire scenario events manually (including
+  *Acoustic regain* to resurface a submerged UUV).
+- A vehicle with no fresh fix (silent / submerged / lost-comms) draws a growing,
+  amber, dashed **uncertainty cone** — an anisotropic ellipse aligned to its
+  last heading, drawn straight from the snapshot's `sigma_*` fields and labelled
+  with the no-fix duration and ± radius.
+- **Fast-forward** controls (bottom-left): `+1m`, `+5m`, and `⏭ Next event` jump
+  the sim clock so scripted events fire without real-time waiting.
 - **Assign a waypoint:** click a vehicle → *Assign Waypoint* → click the map.
   A dashed line is drawn and the vehicle steers there. **Esc** cancels.
 - **Grey chevrons** are real AIS traffic (when a key is configured).
-- The right sidebar shows the fleet list, alert queue, and a live environment
-  strip (sea state, waves, wind, temperature).
+- The right sidebar shows the fleet list, an **Alerts / Acknowledged** tabbed
+  queue (acknowledging is a placeholder for a future DSS action; the Alerts tab
+  ranks by importance, shows the top 3, and collapses the rest under a "+N"
+  bar), and a live environment strip (sea state, waves, wind, temperature).

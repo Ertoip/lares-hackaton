@@ -46,10 +46,19 @@ import os
 import time
 from datetime import datetime, timezone
 
+import requests
 import websockets
 
 SIM_WS_URL = os.environ.get("SIM_WS_URL", "ws://localhost:8000/ws")
 DSS_WS_URL = os.environ.get("DSS_WS_URL", "ws://localhost:8001/dss/ws/vehicles")
+
+# Reverse path (DSS decision -> sim execution). The DSS pushes commands on a
+# command-output socket; we translate and POST them to the sim's /command. The
+# command socket does not exist in README_dss.md yet — README_dss_commands.md
+# documents the schema we expect the teammate to emit. Both endpoints are
+# env-overridable so they can point at the real DSS / a test stub.
+DSS_CMD_WS_URL = os.environ.get("DSS_CMD_WS_URL", "ws://localhost:8001/dss/ws/commands")
+SIM_CMD_URL = os.environ.get("SIM_CMD_URL", "http://localhost:8000/command")
 
 # Seconds of expected_blackout window advertised to the DSS when a vehicle goes
 # silent. Roughly matches SCENARIO_A's ~25 min acoustic blackout; the DSS will
@@ -80,6 +89,30 @@ SENSOR_SOURCES = {
     "camera": ("visual_ISR", "thermal_ISR"),
     "radar": ("surface_radar",),
     "sonar": ("active_sonar", "passive_sonar"),
+}
+
+# Reverse direction: DSS vehicle id -> sim id, and the DSS's command vocabulary
+# -> the sim's /command action enum (the canonical contract in commands.py.ACTIONS).
+SIM_ID = {v: k for k, v in DSS_ID.items()}     # "sub_1" -> "UUV-1"
+
+# The canonical action names ARE the contract; the ideal is that the DSS emits
+# these directly, making this map an identity we could drop. The extra aliases
+# below (goto/dive/return_home/...) are PROVISIONAL guesses kept only so we're not
+# blocked on exact naming before integration. AT INTEGRATION: replace them with
+# the DSS's real action strings and delete the rest — don't carry dead synonyms.
+DSS_ACTION_MAP = {
+    # canonical (preferred — DSS should emit these)
+    "reroute": "reroute", "reassign_task": "reassign_task",
+    "set_depth": "set_depth", "set_altitude": "set_altitude",
+    "surface": "surface", "submerge": "submerge",
+    "hold": "hold", "resume": "resume", "rtb": "rtb",
+    "abort": "abort", "set_status": "set_status",
+    # provisional aliases — prune to the DSS's actual vocabulary on integration
+    "goto": "reroute", "move_to": "reroute",
+    "assign_task": "reassign_task", "tasking": "reassign_task",
+    "dive": "set_depth", "climb": "set_altitude",
+    "loiter": "hold", "station_keep": "hold",
+    "return_home": "rtb", "return_to_base": "rtb", "cancel": "abort",
 }
 
 
@@ -426,14 +459,15 @@ async def _drain_acks(dss):
         return
 
 
-async def run():
+async def run_forward():
+    """Forward path: sim snapshot stream -> DSS messages (heartbeat/telemetry/...)."""
     state = BridgeState()
-    print(f"[bridge] sim={SIM_WS_URL}  ->  dss={DSS_WS_URL}")
+    print(f"[bridge] forward: sim={SIM_WS_URL}  ->  dss={DSS_WS_URL}")
     while True:
         try:
             async with websockets.connect(DSS_WS_URL) as dss, \
                        websockets.connect(SIM_WS_URL) as sim:
-                print("[bridge] connected to both sockets")
+                print("[bridge] forward connected to both sockets")
                 ack_task = asyncio.create_task(_drain_acks(dss))
                 try:
                     async for raw in sim:
@@ -445,8 +479,72 @@ async def run():
                 finally:
                     ack_task.cancel()
         except Exception as e:
-            print(f"[bridge] connection lost ({e!r}); retrying in 2s")
+            print(f"[bridge] forward connection lost ({e!r}); retrying in 2s")
             await asyncio.sleep(2)
+
+
+# --------------------------------------------------------------------------- #
+# Reverse path: DSS decision -> sim /command
+# --------------------------------------------------------------------------- #
+def translate_command(dss_cmd: dict) -> dict | None:
+    """Map a DSS command message onto the sim's /command contract.
+
+    Expected DSS shape (README_dss_commands.md):
+        {"command_id", "vehicle_id": "sub_1", "action": "...", "params": {...}}
+    Returns a sim CommandRequest dict, or None if it can't be translated (logged
+    by the caller). Unknown actions/ids are dropped rather than guessed.
+    """
+    sim_id = SIM_ID.get(dss_cmd.get("vehicle_id"))
+    action = DSS_ACTION_MAP.get((dss_cmd.get("action") or "").lower())
+    if sim_id is None or action is None:
+        return None
+    return {
+        "command_id": str(dss_cmd.get("command_id") or f"dss_{int(time.time()*1000)}"),
+        "vehicle_id": sim_id,
+        "action": action,
+        "params": dss_cmd.get("params") or {},
+        "issued_by": dss_cmd.get("issued_by", "dss"),
+        "ts": dss_cmd.get("ts"),
+    }
+
+
+def _post_command(cmd: dict) -> dict:
+    """Blocking POST to the sim (run off the event loop via asyncio.to_thread)."""
+    r = requests.post(SIM_CMD_URL, json=cmd, timeout=5)
+    return r.json()
+
+
+async def run_reverse():
+    """Reverse path: subscribe to the DSS command socket and execute on the sim."""
+    print(f"[bridge] reverse: dss_cmd={DSS_CMD_WS_URL}  ->  sim={SIM_CMD_URL}")
+    while True:
+        try:
+            async with websockets.connect(DSS_CMD_WS_URL) as dss_cmd:
+                print("[bridge] reverse connected to DSS command socket")
+                async for raw in dss_cmd:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    cmd = translate_command(msg)
+                    if cmd is None:
+                        print(f"[bridge] dropped untranslatable command: {msg}")
+                        continue
+                    try:
+                        ack = await asyncio.to_thread(_post_command, cmd)
+                        print(f"[bridge] command -> sim: {cmd['vehicle_id']} "
+                              f"{cmd['action']} => {ack.get('status')} ({ack.get('reason')})")
+                    except Exception as e:
+                        print(f"[bridge] POST /command failed ({e!r})")
+        except Exception as e:
+            print(f"[bridge] reverse connection lost ({e!r}); retrying in 2s")
+            await asyncio.sleep(2)
+
+
+async def run():
+    # Forward and reverse run independently; one socket being down never stops
+    # the other (each retries on its own).
+    await asyncio.gather(run_forward(), run_reverse())
 
 
 if __name__ == "__main__":

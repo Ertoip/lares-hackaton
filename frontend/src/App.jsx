@@ -5,7 +5,7 @@ import {
   Marker,
   Tooltip,
   Popup,
-  Circle,
+  Polygon,
   Polyline,
   useMapEvents,
 } from "react-leaflet";
@@ -28,7 +28,7 @@ function statusColor(v) {
       return "#f1c40f"; // yellow
     case "lost_comms":
     case "bingo":
-      return "#e74c3c"; // red
+      return "#fe8104"; // orange
 
 
     default:
@@ -98,6 +98,26 @@ function aisIcon(heading = 0) {
   });
 }
 
+// Mothership — the crewed command vessel. A big gold star so it's unmistakable
+// among the small vehicle/AIS markers; pulsing ring drawn via CSS.
+function mothershipIcon() {
+  const html = `<svg width="46" height="46" viewBox="0 0 46 46"
+    xmlns="http://www.w3.org/2000/svg">
+    <circle cx="23" cy="23" r="21" fill="none" stroke="#ffd700"
+      stroke-width="1.5" opacity="0.7"/>
+    <polygon points="23,4 28,17 42,17 31,26 35,40 23,32 11,40 15,26 4,17 18,17"
+      fill="#ffd700" stroke="#7a5c00" stroke-width="2"
+      stroke-linejoin="round"/></svg>`;
+  return L.divIcon({
+    html,
+    className: "mothership-icon",
+    iconSize: [46, 46],
+    iconAnchor: [23, 23],
+  });
+}
+
+const MOTHERSHIP_ICON = mothershipIcon();
+
 function contactIcon() {
   const html = `<svg width="26" height="26" viewBox="0 0 26 26"
     xmlns="http://www.w3.org/2000/svg">
@@ -114,6 +134,17 @@ function contactIcon() {
 
 const CONTACT_ICON = contactIcon();
 
+// Small floating box above a returning vehicle showing its ETA to the ship.
+function etaLabelIcon(etaSec) {
+  const txt = etaSec == null ? "ETA —" : `ETA ${fmtBlackout(etaSec)}`;
+  return L.divIcon({
+    html: `<div class="eta-box">${txt}</div>`,
+    className: "eta-icon",
+    iconSize: [0, 0],
+    iconAnchor: [0, 0],
+  });
+}
+
 // --------------------------------------------------------------------- //
 // Helpers
 // --------------------------------------------------------------------- //
@@ -125,6 +156,50 @@ function fmtBlackout(sec) {
   const m = Math.floor(sec / 60);
   const s = Math.round(sec % 60);
   return `${m}m ${s}s`;
+}
+
+// A vehicle is "lost" (no fresh fix) when it's submerged, stale, in an
+// acoustic blackout, or its link has dropped. These get the uncertainty cone.
+function lostConnection(v) {
+  return !!(v.submerged || v.stale || v.in_blackout || v.status === "lost_comms");
+}
+
+// Build the ring (array of [lat, lon]) of the anisotropic position-uncertainty
+// ellipse. The semi-axis `alongM` points along `headingDeg` (clockwise from
+// north); `crossM` is perpendicular. Both are metres, converted to degrees
+// locally. This is the "search cone" the operator must cover.
+function uncertaintyEllipse(lat, lon, alongM, crossM, headingDeg, steps = 48) {
+  const mPerDegLat = 111320;
+  const mPerDegLon = 111320 * Math.cos((lat * Math.PI) / 180) || 1;
+  const hdg = (headingDeg * Math.PI) / 180;
+  const cosH = Math.cos(hdg);
+  const sinH = Math.sin(hdg);
+  const ring = [];
+  for (let i = 0; i < steps; i++) {
+    const t = (i / steps) * 2 * Math.PI;
+    const a = alongM * Math.cos(t); // along-heading component
+    const c = crossM * Math.sin(t); // cross-heading component
+    const northM = a * cosH - c * sinH;
+    const eastM = a * sinH + c * cosH;
+    ring.push([lat + northM / mPerDegLat, lon + eastM / mPerDegLon]);
+  }
+  return ring;
+}
+
+// Interim alert importance ranking (higher = more important). Used to pick the
+// top-N alerts to surface. Prefers a backend-supplied `priority` when present,
+// so once the DSS attaches real weights this keeps working with no UI change.
+const ALERT_SEVERITY = {
+  bingo_warning: 5,
+  threat_contact: 4,
+  prebingo_warning: 3,
+  sensor_failure: 2,
+  acoustic_loss: 1,
+  vehicle_docked: 0,
+};
+function alertRank(a) {
+  if (a.priority != null) return a.priority;
+  return ALERT_SEVERITY[a.type] ?? 1;
 }
 
 // Captures map clicks while in waypoint-assignment mode.
@@ -142,14 +217,16 @@ function MapClickHandler({ active, onPick }) {
 // --------------------------------------------------------------------- //
 export default function App() {
   const [vehicles, setVehicles] = useState([]);
+  const [mothership, setMothership] = useState(null);
   const [contacts, setContacts] = useState([]);
   const [aisVessels, setAisVessels] = useState([]);
   const [weather, setWeather] = useState(null);
   const [alerts, setAlerts] = useState([]);
-  const [acked, setAcked] = useState(new Set());
+  // _key -> acknowledged alert (kept here so it survives the backend's 10-item
+  // cap). Acknowledging is the placeholder action until the DSS layer lands.
+  const [ackedAlerts, setAckedAlerts] = useState({});
   const [simTime, setSimTime] = useState(0);
   const [connected, setConnected] = useState(false);
-  const [estimates, setEstimates] = useState({}); // vid -> estimate
   const [assignMode, setAssignMode] = useState(null); // vehicle id awaiting waypoint
 
   const wsRef = useRef(null);
@@ -169,6 +246,7 @@ export default function App() {
       ws.onmessage = (evt) => {
         const msg = JSON.parse(evt.data);
         setVehicles(msg.vehicles || []);
+        setMothership(msg.mothership || null);
         setContacts(msg.contacts || []);
         setAisVessels(msg.ais || []);
         setWeather(msg.weather || null);
@@ -183,35 +261,6 @@ export default function App() {
     };
   }, []);
 
-  // ---- Poll /estimate for submerged UUVs every 3s ----
-  useEffect(() => {
-    const submerged = vehicles.filter((v) => v.submerged).map((v) => v.id);
-    if (submerged.length === 0) {
-      setEstimates({});
-      return;
-    }
-    let cancelled = false;
-    async function poll() {
-      const out = {};
-      for (const id of submerged) {
-        try {
-          const r = await fetch(`${API}/estimate/${id}`);
-          const data = await r.json();
-          if (data.uncertainty_radius_m != null) out[id] = data;
-        } catch (e) {
-          /* ignore transient errors */
-        }
-      }
-      if (!cancelled) setEstimates(out);
-    }
-    poll();
-    const t = setInterval(poll, 3000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, [vehicles.map((v) => `${v.id}:${v.submerged}`).join(",")]);
-
   // ---- Esc cancels waypoint-assignment mode ----
   useEffect(() => {
     function onKey(e) {
@@ -225,6 +274,22 @@ export default function App() {
   const injectEvent = useCallback(async (type) => {
     try {
       await fetch(`${API}/inject/${type}`, { method: "POST" });
+    } catch (e) {
+      /* ignore */
+    }
+  }, []);
+
+  const fastForward = useCallback(async (seconds) => {
+    try {
+      await fetch(`${API}/fast_forward/${seconds}`, { method: "POST" });
+    } catch (e) {
+      /* ignore */
+    }
+  }, []);
+
+  const skipToNextEvent = useCallback(async () => {
+    try {
+      await fetch(`${API}/skip_to_next_event`, { method: "POST" });
     } catch (e) {
       /* ignore */
     }
@@ -253,15 +318,31 @@ export default function App() {
     [assignMode]
   );
 
-  const ackAlert = (key) =>
-    setAcked((prev) => new Set(prev).add(key));
+  // Acknowledge = move the alert into the acknowledged store (placeholder for a
+  // real DSS-driven action). Restore moves it back to the active list.
+  const ackAlert = (alert) =>
+    setAckedAlerts((prev) => ({
+      ...prev,
+      [alert._key]: { ...alert, ackedAt: Date.now() / 1000 },
+    }));
 
-  // Build a stable key per alert and filter acknowledged ones; show max 3.
-  const visibleAlerts = alerts
-    .map((a, i) => ({ ...a, _key: `${a.type}-${a.ts}-${a.vehicle || i}` }))
-    .filter((a) => !acked.has(a._key))
-    .slice(-3)
-    .reverse();
+  const unackAlert = (key) =>
+    setAckedAlerts((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+
+  // Build a stable key per alert, then split into active vs acknowledged.
+  const allAlerts = alerts.map((a, i) => ({
+    ...a,
+    _key: `${a.type}-${a.ts}-${a.vehicle || i}`,
+  }));
+  // All unacknowledged alerts; the sidebar ranks them and shows the top few.
+  const activeAlerts = allAlerts.filter((a) => !ackedAlerts[a._key]);
+  const acknowledgedAlerts = Object.values(ackedAlerts).sort(
+    (a, b) => (b.ackedAt || 0) - (a.ackedAt || 0)
+  );
 
   return (
     <div className="app">
@@ -273,6 +354,9 @@ export default function App() {
         <div className="inject-bar">
           <button onClick={() => injectEvent("acoustic_loss")}>
             Inject: Acoustic loss
+          </button>
+          <button onClick={() => injectEvent("acoustic_regain")}>
+            Inject: Acoustic regain
           </button>
           <button onClick={() => injectEvent("threat_contact")}>
             Inject: Threat contact
@@ -293,6 +377,15 @@ export default function App() {
 
         <div className="sim-clock">SIM T+{simTime}s</div>
 
+        <div className="ff-bar">
+          <span className="ff-label">Fast-forward</span>
+          <button onClick={() => fastForward(60)}>+1m</button>
+          <button onClick={() => fastForward(300)}>+5m</button>
+          <button className="ff-next" onClick={skipToNextEvent}>
+            ⏭ Next event
+          </button>
+        </div>
+
         <MapContainer center={CENTER} zoom={11} zoomControl={true}>
           <TileLayer
             attribution='&copy; OpenStreetMap contributors'
@@ -301,16 +394,33 @@ export default function App() {
 
           <MapClickHandler active={!!assignMode} onPick={handleWaypointPick} />
 
-          {/* Vehicles */}
+          {/* Mothership — crewed command vessel, position simply known. */}
+          {mothership && (
+            <Marker
+              position={[mothership.lat, mothership.lon]}
+              icon={MOTHERSHIP_ICON}
+              zIndexOffset={500}
+            >
+              <Tooltip direction="top" offset={[0, -22]}>
+                <div className="veh-tooltip">
+                  <b>{mothership.id}</b> (mothership)
+                  <br />
+                  Crewed command vessel — no telemetry link
+                  <br />
+                  Heading {Math.round(mothership.heading)}° ·{" "}
+                  {fmtNum(mothership.speed_knots, " kn")}
+                </div>
+              </Tooltip>
+            </Marker>
+          )}
+
+          {/* Vehicles — drawn at their (dead-reckoned) perceived position. */}
           {vehicles.map((v) => {
-            const est = estimates[v.id];
-            // Submerged UUVs are drawn at their estimated position if known.
-            const pos =
-              v.submerged && est ? [est.lat, est.lon] : [v.lat, v.lon];
+            const lost = lostConnection(v);
             return (
               <Marker
                 key={v.id}
-                position={pos}
+                position={[v.lat, v.lon]}
                 icon={vehicleIcon(v, assignMode === v.id)}
                 zIndexOffset={assignMode === v.id ? 1000 : 0}
               >
@@ -319,12 +429,22 @@ export default function App() {
                     <b>{v.id}</b> ({v.type})<br />
                     Status: {v.submerged ? "submerged" : v.status}
                     <br />
-                    Battery: {v.battery_pct}%<br />
+                    Speed: {fmtNum(v.speed_knots, " kn")} · Heading:{" "}
+                    {v.heading == null ? "—" : `${Math.round(v.heading)}°`}
+                    <br />
+                    Battery: {Math.round(v.battery_pct)}%<br />
                     Last contact: {ageSeconds(v.last_contact_ts)}s ago
                     <br />
                     Task: {v.current_task}
                     <br />
                     Link: {v.link_type} ({Math.round(v.link_quality * 100)}%)
+                    {v.sigma_m != null && (
+                      <>
+                        <br />
+                        Est. uncertainty: ±{Math.round(v.sigma_m)} m
+                        {lost ? " (no fix)" : ""}
+                      </>
+                    )}
                   </div>
                 </Tooltip>
                 <Popup>
@@ -343,51 +463,66 @@ export default function App() {
             );
           })}
 
+          {/* ETA-to-ship box above vehicles returning to the mothership */}
+          {vehicles
+            .filter((v) => v.rtb)
+            .map((v) => (
+              <Marker
+                key={`eta-${v.id}`}
+                position={[v.lat, v.lon]}
+                icon={etaLabelIcon(v.eta_to_ship_sec)}
+                interactive={false}
+                zIndexOffset={600}
+              />
+            ))}
+
           {/* Assigned-waypoint dashed lines */}
           {vehicles
             .filter((v) => v.waypoint)
-            .map((v) => {
-              const est = estimates[v.id];
-              const from =
-                v.submerged && est ? [est.lat, est.lon] : [v.lat, v.lon];
-              return (
-                <Polyline
-                  key={`wp-${v.id}`}
-                  positions={[from, [v.waypoint.lat, v.waypoint.lon]]}
-                  pathOptions={{
-                    color: "#1f6feb",
-                    dashArray: "8 8",
-                    weight: 2,
-                  }}
-                />
-              );
-            })}
+            .map((v) => (
+              <Polyline
+                key={`wp-${v.id}`}
+                positions={[[v.lat, v.lon], [v.waypoint.lat, v.waypoint.lon]]}
+                pathOptions={{
+                  color: "#1f6feb",
+                  dashArray: "8 8",
+                  weight: 2,
+                }}
+              />
+            ))}
 
-          {/* Submerged-UUV uncertainty circles + blackout labels */}
-          {vehicles
-            .filter((v) => v.submerged && estimates[v.id])
-            .map((v) => {
-              const est = estimates[v.id];
-              return (
-                <Circle
-                  key={`est-${v.id}`}
-                  center={[est.lat, est.lon]}
-                  radius={est.uncertainty_radius_m}
-                  pathOptions={{
-                    color: "#3b82f6",
-                    fillColor: "#3b82f6",
-                    fillOpacity: 0.18,
-                    weight: 1,
-                  }}
-                >
-                  <Tooltip permanent direction="bottom">
-                    {v.id} — In blackout —{" "}
-                    {fmtBlackout(est.blackout_duration_sec)} (±
-                    {Math.round(est.uncertainty_radius_m)}m)
-                  </Tooltip>
-                </Circle>
-              );
-            })}
+          {/* Estimated-position uncertainty cone for vehicles with no fix.
+              Anisotropic ellipse: long axis = along-track (time), short axis
+              = cross-track (heading drift). */}
+          {vehicles.filter(lostConnection).map((v) => {
+            const along = v.sigma_along_m ?? v.sigma_m ?? 0;
+            const cross = v.sigma_cross_m ?? v.sigma_m ?? 0;
+            const ring = uncertaintyEllipse(
+              v.lat,
+              v.lon,
+              along,
+              cross,
+              v.uncertainty_heading_deg ?? v.heading ?? 0
+            );
+            return (
+              <Polygon
+                key={`cone-${v.id}`}
+                positions={ring}
+                pathOptions={{
+                  color: "#f59e0b",
+                  fillColor: "#f59e0b",
+                  fillOpacity: 0.15,
+                  weight: 1.5,
+                  dashArray: "4 4",
+                }}
+              >
+                <Tooltip permanent direction="bottom">
+                  {v.id} — {v.submerged ? "submerged" : "lost comms"} ·{" "}
+                  {fmtBlackout(v.age_sec ?? 0)} (±{Math.round(v.sigma_m ?? 0)}m)
+                </Tooltip>
+              </Polygon>
+            );
+          })}
 
           {/* Real AIS traffic (grey) */}
           {aisVessels.map((s) => (
@@ -436,10 +571,12 @@ export default function App() {
       {/* ---- Sidebar ---- */}
       <Sidebar
         vehicles={vehicles}
-        alerts={visibleAlerts}
+        alerts={activeAlerts}
+        acknowledged={acknowledgedAlerts}
         weather={weather}
         aisCount={aisVessels.length}
         onAck={ackAlert}
+        onUnack={unackAlert}
         onSelect={(id) => setAssignMode(id)}
       />
     </div>
@@ -453,7 +590,43 @@ function fmtNum(n, unit = "", digits = 1) {
   return n == null ? "—" : `${Number(n).toFixed(digits)}${unit}`;
 }
 
-function Sidebar({ vehicles, alerts, weather, aisCount, onAck, onSelect }) {
+function Sidebar({
+  vehicles,
+  alerts,
+  acknowledged,
+  weather,
+  aisCount,
+  onAck,
+  onUnack,
+  onSelect,
+}) {
+  const [tab, setTab] = useState("active");
+  const [showAll, setShowAll] = useState(false);
+
+  // Rank active alerts by importance and surface only the top 3; the rest
+  // collapse under a "+N" bar the operator can expand.
+  const sortedActive = [...alerts].sort(
+    (a, b) =>
+      alertRank(b) - alertRank(a) || (b.sim_time_sec ?? 0) - (a.sim_time_sec ?? 0)
+  );
+  const shownActive = showAll ? sortedActive : sortedActive.slice(0, 3);
+  const hiddenCount = sortedActive.length - shownActive.length;
+
+  const renderCard = (a, acked) => (
+    <div key={a._key} className={`alert-card ${acked ? "acked " : ""}${a.type}`}>
+      <div className="atype">{a.type.replace(/_/g, " ")}</div>
+      <div className="amsg">{a.message}</div>
+      <div className="arow">
+        <span className="ats">
+          {a.vehicle ? `${a.vehicle} · ` : ""}T+{a.sim_time_sec}s
+        </span>
+        <button className="ack" onClick={() => (acked ? onUnack(a._key) : onAck(a))}>
+          {acked ? "Restore" : "Acknowledge"}
+        </button>
+      </div>
+    </div>
+  );
+
   return (
     <div className="sidebar">
       <div className="sidebar-section">
@@ -472,34 +645,58 @@ function Sidebar({ vehicles, alerts, weather, aisCount, onAck, onSelect }) {
               />
               <span className="vid">{v.id}</span>
               <span>{v.submerged ? "submerged" : v.status}</span>
-              <span className="vmeta">{v.battery_pct}%</span>
+              <span className="vmeta">{Math.round(v.battery_pct)}%</span>
             </div>
           ))}
         </div>
       </div>
 
-      <div className="sidebar-section" style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-        <div className="sidebar-header">Alerts</div>
+      <div className="sidebar-section" style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+        <div className="alert-tabs">
+          <button
+            className={`alert-tab ${tab === "active" ? "active" : ""}`}
+            onClick={() => setTab("active")}
+          >
+            Alerts
+            {alerts.length > 0 && <span className="tab-badge">{alerts.length}</span>}
+          </button>
+          <button
+            className={`alert-tab ${tab === "acked" ? "active" : ""}`}
+            onClick={() => setTab("acked")}
+          >
+            Acknowledged
+            {acknowledged.length > 0 && (
+              <span className="tab-badge muted">{acknowledged.length}</span>
+            )}
+          </button>
+        </div>
         <div className="alerts">
-          {alerts.length === 0 && (
-            <div style={{ color: "#5f7c8c", fontSize: 12, padding: 6 }}>
-              No active alerts.
+          {tab === "active" ? (
+            sortedActive.length === 0 ? (
+              <div className="alerts-empty">No active alerts.</div>
+            ) : (
+              <>
+                {shownActive.map((a) => renderCard(a, false))}
+                {hiddenCount > 0 && (
+                  <button className="more-bar" onClick={() => setShowAll(true)}>
+                    unacknowledged events +{hiddenCount}
+                  </button>
+                )}
+                {showAll && sortedActive.length > 3 && (
+                  <button className="more-bar" onClick={() => setShowAll(false)}>
+                    show fewer
+                  </button>
+                )}
+              </>
+            )
+          ) : acknowledged.length === 0 ? (
+            <div className="alerts-empty">
+              Nothing acknowledged yet. Acknowledging an alert is a placeholder
+              for an operator action — the DSS layer will replace it.
             </div>
+          ) : (
+            acknowledged.map((a) => renderCard(a, true))
           )}
-          {alerts.map((a) => (
-            <div key={a._key} className={`alert-card ${a.type}`}>
-              <div className="atype">{a.type.replace(/_/g, " ")}</div>
-              <div className="amsg">{a.message}</div>
-              <div className="arow">
-                <span className="ats">
-                  {a.vehicle ? `${a.vehicle} · ` : ""}T+{a.sim_time_sec}s
-                </span>
-                <button className="ack" onClick={() => onAck(a._key)}>
-                  Acknowledge
-                </button>
-              </div>
-            </div>
-          ))}
         </div>
       </div>
 

@@ -101,13 +101,110 @@ body,
 }
 
 /* ----- Alerts ----- */
+.alert-tabs {
+  display: flex;
+  background: #12222c;
+  border-bottom: 1px solid #1d3340;
+}
+.alert-tab {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #6c8a9b;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 10px 8px;
+  cursor: pointer;
+}
+.alert-tab:hover {
+  color: #9fc3d6;
+}
+.alert-tab.active {
+  color: #6fb3d2;
+  border-bottom-color: #6fb3d2;
+  background: #0f1c24;
+}
+.tab-badge {
+  background: #e0a800;
+  color: #1a2c38;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 9px;
+  padding: 0 6px;
+  min-width: 16px;
+  text-align: center;
+}
+.tab-badge.muted {
+  background: #2a4a5c;
+  color: #d6e4ee;
+}
+.alerts-empty {
+  color: #5f7c8c;
+  font-size: 12px;
+  padding: 6px;
+  line-height: 1.5;
+}
 .alerts {
   flex: 1;
+  min-height: 0; /* let the flex child shrink so overflow-y actually scrolls */
   overflow-y: auto;
   padding: 8px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Visible scroll slider when alerts overfill (Firefox). */
+  scrollbar-width: thin;
+  scrollbar-color: #36617a #0f1c24;
+}
+/* Visible scroll slider when alerts overfill (WebKit/Chromium). */
+.alerts::-webkit-scrollbar {
+  width: 9px;
+}
+.alerts::-webkit-scrollbar-track {
+  background: #0f1c24;
+}
+.alerts::-webkit-scrollbar-thumb {
+  background: #2a4a5c;
+  border-radius: 5px;
+  border: 2px solid #0f1c24;
+}
+.alerts::-webkit-scrollbar-thumb:hover {
+  background: #36617a;
+}
+.alert-card.acked {
+  opacity: 0.62;
+  border-left-color: #4a6575;
+}
+.alert-card.vehicle_docked {
+  border-left-color: #2ecc71;
+}
+.alert-card.prebingo_warning {
+  border-left-color: #fe8104;
+}
+
+/* "+N more" collapse bar under the top-ranked alerts. */
+.more-bar {
+  width: 100%;
+  background: #16242d;
+  color: #8aa6b6;
+  border: 1px dashed #2a4a5c;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+}
+.more-bar:hover {
+  background: #1d3340;
+  color: #d6e4ee;
 }
 
 .alert-card {
@@ -197,6 +294,78 @@ button.ack:hover {
   50% {
     filter: drop-shadow(0 0 9px #00e5ff);
   }
+}
+
+/* ETA-to-ship box floating above a returning vehicle. */
+.eta-icon {
+  background: none;
+  border: none;
+}
+.eta-box {
+  position: absolute;
+  /* center horizontally on the point, float above the 28px marker */
+  transform: translate(-50%, calc(-100% - 20px));
+  white-space: nowrap;
+  background: rgba(15, 28, 36, 0.92);
+  color: #ffd700;
+  border: 1px solid #7a5c00;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* Mothership marker — gold star with a slow pulsing glow. */
+.mothership-icon {
+  filter: drop-shadow(0 0 5px rgba(255, 215, 0, 0.9));
+  animation: ms-pulse 2.4s ease-in-out infinite;
+}
+@keyframes ms-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 3px rgba(255, 215, 0, 0.7));
+  }
+  50% {
+    filter: drop-shadow(0 0 10px rgba(255, 215, 0, 1));
+  }
+}
+
+/* ----- Fast-forward controls ----- */
+.ff-bar {
+  position: absolute;
+  bottom: 10px;
+  left: 130px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(15, 28, 36, 0.92);
+  border: 1px solid #2a4a5c;
+  border-radius: 4px;
+  padding: 4px 8px;
+}
+.ff-label {
+  color: #6fb3d2;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.ff-bar button {
+  background: #1d3340;
+  color: #d6e4ee;
+  border: 1px solid #2a4a5c;
+  border-radius: 3px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.ff-bar button:hover {
+  background: #2a4a5c;
+}
+.ff-bar button.ff-next {
+  background: #2a4a5c;
+  font-weight: 600;
 }
 
 /* ----- Inject toolbar (demo controls) ----- */

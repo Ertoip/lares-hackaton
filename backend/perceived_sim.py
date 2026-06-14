@@ -57,6 +57,17 @@ STALE_FACTOR = 4
 DEFAULT_Z = {"UAV": 150.0, "USV": 0.0, "UUV": -40.0}
 SUBMERGED_Z = -80.0
 
+# Battery drain rate (% per second) by type. UAVs drain fastest due to high
+# power demand; UUVs drain slowest (large battery cells, low propulsion load).
+DRAIN_RATE_PCT_PER_SEC = {"UAV": 0.02, "USV": 0.008, "UUV": 0.006}
+
+# Battery bingo threshold (%) by type. UAVs need fuel reserve for return-to-base.
+BINGO_PCT = {"UAV": 25.0, "USV": 20.0, "UUV": 30.0}
+
+# Pre-bingo warning fires this many % above the bingo threshold, giving the
+# operator lead time to react before a vehicle actually reaches bingo.
+PREBINGO_MARGIN_PCT = 10.0
+
 PAYLOAD_DEFAULTS = {"UAV": "sensors_active", "USV": "sensors_active", "UUV": "survey_active"}
 
 # One nautical mile expressed in degrees of latitude.
@@ -75,6 +86,22 @@ MAX_DRIFT_DEG = 45.0        # ceiling on the heading-drift half-angle
 LAT_MIN, LAT_MAX = 50.85, 51.25
 LON_MIN, LON_MAX = 0.90, 2.20
 
+# The mothership: the crewed command vessel the fleet operates from. It is NOT
+# an unmanned, comms-tracked vehicle — its position is simply known, so it has
+# no uncertainty cone, no telemetry rolls and never appears in `perceived`. It
+# just steams slowly across the area.
+MOTHERSHIP_DEF = {
+    "id": "CSV MERIDIAN", "type": "mothership",
+    # Kept below the slowest UUV (3.5 kn) so a returning sub can always close the
+    # gap and dock — a faster ship would simply outrun a bingo'd UUV's pursuit.
+    "lat": 51.05, "lon": 1.55, "heading": 95.0, "speed_knots": 2.5,
+}
+
+# A returning vehicle within this distance of the mothership is considered
+# docked (battery swap / recharge). Larger than the 150 m waypoint-arrival
+# radius so docking resolves before the generic "arrived" logic fires.
+DOCK_RADIUS_M = 400.0
+
 
 def _clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -88,37 +115,37 @@ def _knots_to_deg_per_sec_lat(speed_knots: float) -> float:
 # Initial fleet definition. All vehicles seeded inside the Dover Strait box.
 VEHICLE_DEFS = [
     {
-        "id": "UAV-1", "type": "UAV", "lat": 51.12, "lon": 1.30,
+        "id": "UAV-1", "type": "UAV", "lat": 51.14, "lon": 1.32,
         "heading": 120.0, "speed_knots": 60.0, "battery_pct": 78.0,
         "capabilities": ["visual_ISR", "thermal_ISR"],
         "current_task": "Wide-area ISR patrol",
     },
     {
-        "id": "UAV-2", "type": "UAV", "lat": 50.95, "lon": 1.98,
+        "id": "UAV-2", "type": "UAV", "lat": 50.96, "lon": 1.85,
         "heading": 300.0, "speed_knots": 55.0, "battery_pct": 91.0,
         "capabilities": ["visual_ISR", "comms_relay"],
         "current_task": "Comms relay orbit",
     },
     {
-        "id": "USV-1", "type": "USV", "lat": 51.05, "lon": 1.45,
+        "id": "USV-1", "type": "USV", "lat": 51.12, "lon": 1.45,
         "heading": 45.0, "speed_knots": 18.0, "battery_pct": 84.0,
         "capabilities": ["surface_radar", "active_sonar"],
         "current_task": "Picket line patrol",
     },
     {
-        "id": "USV-2", "type": "USV", "lat": 51.02, "lon": 1.75,
+        "id": "USV-2", "type": "USV", "lat": 50.96, "lon": 1.78,
         "heading": 210.0, "speed_knots": 14.0, "battery_pct": 88.0,
         "capabilities": ["surface_radar", "passive_sonar"],
         "current_task": "ASW screen",
     },
     {
-        "id": "UUV-1", "type": "UUV", "lat": 51.08, "lon": 1.60,
+        "id": "UUV-1", "type": "UUV", "lat": 51.10, "lon": 1.62,
         "heading": 90.0, "speed_knots": 4.0, "battery_pct": 73.0,
         "capabilities": ["passive_sonar", "seabed_mapping"],
         "current_task": "Subsurface survey",
     },
     {
-        "id": "UUV-2", "type": "UUV", "lat": 51.00, "lon": 1.55,
+        "id": "UUV-2", "type": "UUV", "lat": 50.97, "lon": 1.45,
         "heading": 270.0, "speed_knots": 3.5, "battery_pct": 66.0,
         "capabilities": ["passive_sonar", "mine_countermeasures"],
         "current_task": "MCM sweep",
@@ -130,18 +157,28 @@ class PerceivedSimulator:
     """Advances the operator's perceived picture directly (single state)."""
 
     def __init__(self):
+        # Fast-forward offset (seconds) added to the real clock. Bumping this
+        # makes the whole sim — motion, uncertainty growth, the event scheduler
+        # — jump ahead so scripted events fire naturally without real waiting.
+        self.clock_offset = 0.0
         self.start_time = time.time()
         self.perceived = {}       # vid -> estimate record (the only state)
         self.contacts = []        # threat contacts
         self.alerts = []          # recent alert records broadcast to the UI
         self._last_attempt = {}   # vid -> last fix-attempt time
+        self._prebingo_warned = set()  # vids already pre-bingo-warned (fire once)
         # Live data providers, attached by main.py (may stay None).
         self.weather = None
         self.ais = None
 
-        now = time.time()
+        now = self.now()
         for d in VEHICLE_DEFS:
             self._seed(dict(d), now)
+        self._seed_mothership(now)
+
+    def now(self) -> float:
+        """Simulation wall-clock: real time plus any fast-forward offset."""
+        return time.time() + self.clock_offset
 
     # ------------------------------------------------------------------ #
     # Seeding
@@ -171,6 +208,8 @@ class PerceivedSimulator:
             "link_quality": round(random.uniform(0.85, 1.0), 2),
             "current_task": d["current_task"],
             "waypoint": None,
+            "rtb": False,  # auto return-to-ship in progress (set on bingo)
+            "eta_to_ship_sec": None,  # ETA to mothership while rtb (else None)
         }
         self.perceived[vid] = p
         self._last_attempt[vid] = now
@@ -181,7 +220,7 @@ class PerceivedSimulator:
     # ------------------------------------------------------------------ #
     @property
     def sim_time_sec(self) -> int:
-        return int(time.time() - self.start_time)
+        return int(self.now() - self.start_time)
 
     def _sea_state(self):
         """Current Douglas sea state from live weather, or None (-> default)."""
@@ -196,23 +235,181 @@ class PerceivedSimulator:
     # ------------------------------------------------------------------ #
     def tick(self):
         """Run one telemetry cycle per due vehicle, then refresh all estimates."""
-        now = time.time()
+        now = self.now()
         sea = self._sea_state()
 
+        # Move the ship first so any returning vehicle steers toward its fresh
+        # position this tick.
+        self._move_mothership(now)
+
         for vid, p in self.perceived.items():
+            # A returning vehicle re-aims at the (moving) ship every tick.
+            if p.get("rtb"):
+                p["waypoint"] = {"lat": self.mothership["lat"], "lon": self.mothership["lon"]}
             if now - self._last_attempt[vid] >= UPDATE_RATES[p["type"]]:
                 self._attempt_contact(p, now, sea)
                 self._last_attempt[vid] = now
             # Every tick: dead-reckon the estimate forward and grow sigma.
             self._update_estimate(p, now)
+            if p.get("rtb"):
+                self._update_rtb_eta(p)
+                self._check_docking(p)
+            else:
+                p["eta_to_ship_sec"] = None
+
+    # ------------------------------------------------------------------ #
+    # Mothership (crewed command vessel — known position, no telemetry)
+    # ------------------------------------------------------------------ #
+    def _seed_mothership(self, now):
+        d = MOTHERSHIP_DEF
+        lat, lon = d["lat"], d["lon"]
+        if not is_water(lat, lon):
+            lat, lon = snap_to_water(lat, lon)
+        self.mothership = {
+            "id": d["id"], "type": "mothership",
+            "lat": round(lat, 6), "lon": round(lon, 6),
+            "heading": d["heading"], "speed_knots": d["speed_knots"],
+        }
+        self._mothership_ts = now
+
+    def _move_mothership(self, now):
+        """Steam slowly along heading; turn away from land / the box edge."""
+        m = self.mothership
+        dt = max(0.0, now - self._mothership_ts)
+        self._mothership_ts = now
+        if dt <= 0:
+            return
+        step_lat = _knots_to_deg_per_sec_lat(m["speed_knots"]) * dt
+        hdg = math.radians(m["heading"])
+        new_lat = m["lat"] + step_lat * math.cos(hdg)
+        coslat = max(0.1, math.cos(math.radians(m["lat"])))
+        new_lon = m["lon"] + (step_lat * math.sin(hdg)) / coslat
+        blocked = (
+            not is_water(new_lat, new_lon)
+            or not (LAT_MIN <= new_lat <= LAT_MAX)
+            or not (LON_MIN <= new_lon <= LON_MAX)
+        )
+        if blocked:
+            m["heading"] = (m["heading"] + 150 + random.uniform(-30, 30)) % 360
+            return
+        m["lat"], m["lon"] = round(new_lat, 6), round(new_lon, 6)
+
+    # ------------------------------------------------------------------ #
+    # Return-to-ship + recharge (auto-triggered on bingo)
+    # ------------------------------------------------------------------ #
+    def trigger_bingo(self, vid, battery_pct=None, push_alert=True):
+        """Single entry point for entering bingo, used by both the organic
+        battery-drain path and the manual ``bingo_warning`` injection. Keeps the
+        two from diverging (the inject used to skip the auto-return)."""
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        if battery_pct is not None:
+            p["battery_pct"] = battery_pct
+        p["status"] = "bingo"
+        # A bingo supersedes its own pre-bingo warning — drop the stale one.
+        self.alerts = [
+            a for a in self.alerts
+            if not (a.get("type") == "prebingo_warning" and a.get("vehicle") == vid)
+        ]
+        if push_alert:
+            self.push_alert({
+                "type": "bingo_warning",
+                "vehicle": vid,
+                "message": f"{vid} BINGO fuel — battery at {p['battery_pct']:.0f}% — returning to ship",
+            })
+        self._begin_rtb(p)
+
+    def _begin_rtb(self, p):
+        """Send a bingo'd vehicle home. Submerged UUVs surface first so they can
+        navigate to the ship and dock; status stays `bingo` until recharged."""
+        if p.get("submerged"):
+            # Un-submerge WITHOUT calling surface() (which would reset status to
+            # nominal and clear the bingo we just set).
+            p["submerged"] = False
+            p["z_m"] = DEFAULT_Z[p["type"]]
+            p["last_contact_ts"] = self.now()
+        p["rtb"] = True
+        p["current_task"] = "RTB — returning to ship for recharge"
+        p["waypoint"] = {"lat": self.mothership["lat"], "lon": self.mothership["lon"]}
+
+    def _update_rtb_eta(self, p):
+        """ETA (sec) to the mothership, accounting for both velocities.
+
+        The vehicle heads straight at the ship, so its full speed closes the
+        range; the ship's velocity only counts by its component *along* the
+        vehicle->ship line (it helps if steaming toward the vehicle, hurts if
+        fleeing). closing = v_vehicle - (ship velocity . bearing-to-ship)."""
+        m = self.mothership
+        dist_m = self._haversine_m(p["lat"], p["lon"], m["lat"], m["lon"])
+        brg = math.radians(self._bearing(p["lat"], p["lon"], m["lat"], m["lon"]))
+        dn, de = math.cos(brg), math.sin(brg)  # vehicle->ship unit (north, east)
+        shdg = math.radians(m["heading"])
+        ship_radial = (
+            m["speed_knots"] * math.cos(shdg) * dn
+            + m["speed_knots"] * math.sin(shdg) * de
+        )
+        closing_kn = p["speed_knots"] - ship_radial
+        if closing_kn <= 0.05:
+            p["eta_to_ship_sec"] = None  # not gaining on the ship
+            return
+        p["eta_to_ship_sec"] = round(dist_m / (closing_kn * KN_TO_MPS))
+
+    def _check_docking(self, p):
+        """Dock + recharge once the vehicle reaches the mothership."""
+        d = self._haversine_m(
+            p["fix_lat"], p["fix_lon"], self.mothership["lat"], self.mothership["lon"]
+        )
+        if d <= DOCK_RADIUS_M:
+            self._dock(p)
+
+    def _dock(self, p):
+        p["battery_pct"] = 100.0
+        p["status"] = "nominal"
+        p["rtb"] = False
+        p["waypoint"] = None
+        p["eta_to_ship_sec"] = None
+        self._prebingo_warned.discard(p["id"])
+        # Recharged and idle at the ship. We don't pick its next job here — the
+        # DSS does. Mark it awaiting tasking and emit an alert the bridge forwards
+        # as a DSS event, closing the loop: dock -> event -> DSS decides ->
+        # reassign_task command -> POST /command -> assign_task.
+        p["current_task"] = "Awaiting tasking"
+        self.push_alert({
+            "type": "vehicle_docked",
+            "vehicle": p["id"],
+            "message": f"{p['id']} docked at {self.mothership['id']} — recharged to 100%",
+        })
+        self.push_alert({
+            "type": "awaiting_tasking",
+            "vehicle": p["id"],
+            "message": f"{p['id']} recharged and idle at {self.mothership['id']} — awaiting DSS tasking",
+        })
 
     def _attempt_contact(self, p, now, sea):
         """One telemetry cycle: maybe receive a fresh fix; always age scalars."""
         # Battery + link quality evolve whether or not the packet gets through.
         self._drain_battery(p, now)
         self._update_link_quality(p, sea)
-        if p["battery_pct"] <= 15 and p["status"] == "nominal":
-            p["status"] = "bingo"
+        if p["battery_pct"] <= BINGO_PCT[p["type"]] and p["status"] != "bingo":
+            self.trigger_bingo(p["id"])
+
+        # Pre-bingo warning: lead-time heads-up before reaching bingo. Fires for
+        # already-troubled vehicles too (a low battery on top of another fault
+        # is exactly when it matters); only a vehicle already AT bingo is spared
+        # the redundant "approaching" message. Re-arms if battery recovers.
+        prebingo = BINGO_PCT[p["type"]] + PREBINGO_MARGIN_PCT
+        if p["battery_pct"] <= prebingo and p["status"] != "bingo":
+            if p["id"] not in self._prebingo_warned:
+                self._prebingo_warned.add(p["id"])
+                self.push_alert({
+                    "type": "prebingo_warning",
+                    "vehicle": p["id"],
+                    "message": f"{p['id']} battery {p['battery_pct']:.0f}% — approaching "
+                               f"bingo ({BINGO_PCT[p['type']]:.0f}%)",
+                })
+        else:
+            self._prebingo_warned.discard(p["id"])
 
         # Does a fresh fix arrive this cycle? (submerged acoustic ~ never)
         sea_val = sea if sea is not None else 3
@@ -267,9 +464,12 @@ class PerceivedSimulator:
         p["fix_heading"] = (p["fix_heading"] + random.gauss(0, 1.5)) % 360
 
     def _drain_battery(self, p, now):
+        # Keep full precision: per-cycle drain (e.g. 0.02 %/s x 0.5 s = 0.01%) is
+        # smaller than one rounding step, so round(..., 1) here would erase it
+        # every cycle and the battery would never move. Rounding is for display.
         elapsed = now - self._last_attempt[p["id"]]
-        rate = 0.02 if p["type"] == "UAV" else 0.008
-        p["battery_pct"] = round(max(0.0, p["battery_pct"] - rate * elapsed), 1)
+        rate = DRAIN_RATE_PCT_PER_SEC[p["type"]]
+        p["battery_pct"] = max(0.0, p["battery_pct"] - rate * elapsed)
 
     def _update_link_quality(self, p, sea):
         """Bounded random walk toward the quality implied by conditions."""
@@ -344,7 +544,60 @@ class PerceivedSimulator:
         p["submerged"] = False
         p["z_m"] = DEFAULT_Z[p["type"]]
         p["status"] = "nominal"
-        p["last_contact_ts"] = time.time()  # re-established contact -> sigma resets
+        p["last_contact_ts"] = self.now()  # re-established contact -> sigma resets
+
+    def set_depth(self, vid: str, z_m: float):
+        """Commanded operating depth/altitude (metres relative to the surface:
+        negative = depth below, positive = altitude above). Feeds the comms model
+        via ``z_m``, so a deeper UUV gets a worse acoustic link automatically. A
+        UUV taken below the surface is marked ``submerged`` (acoustic blackout);
+        brought to ~0 it is treated as surfaced."""
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        p["z_m"] = z_m
+        p["fix_z_m"] = z_m
+        if p["type"] == "UUV":
+            if z_m < -1.0:
+                p["submerged"] = True
+                if p["status"] == "nominal":
+                    p["status"] = "lost_comms"
+            else:
+                p["submerged"] = False
+                if p["status"] == "lost_comms":
+                    p["status"] = "nominal"
+                p["last_contact_ts"] = self.now()  # back at the surface -> sigma resets
+
+    def hold(self, vid: str):
+        """Loiter in place: stash current speed and stop. The dead-reckoned
+        estimate freezes (speed 0), so the vehicle holds station until ``resume``."""
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        p.setdefault("_hold_speed", p["fix_speed_knots"])
+        p["fix_speed_knots"] = 0.0
+        if p["status"] == "nominal":
+            p["status"] = "holding"
+
+    def resume(self, vid: str):
+        """Resume from a hold: restore the speed stashed by ``hold``."""
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        if "_hold_speed" in p:
+            p["fix_speed_knots"] = p.pop("_hold_speed")
+        if p["status"] == "holding":
+            p["status"] = "nominal"
+
+    def return_to_ship(self, vid: str):
+        """Commanded return-to-ship (no bingo battery semantics). Reuses the same
+        homing+dock machinery as an automatic bingo RTB; status is ``rtb`` and is
+        reset to ``nominal`` by ``_dock`` on arrival."""
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        p["status"] = "rtb"
+        self._begin_rtb(p)
 
     def estimate_position(self, vid: str):
         """Perceived position + uncertainty (backs GET /estimate/{id})."""
@@ -370,7 +623,7 @@ class PerceivedSimulator:
     def add_contact(self, contact: dict):
         self.contacts = [c for c in self.contacts if c.get("id") != contact.get("id")]
         contact = dict(contact)
-        contact["detected_ts"] = time.time()
+        contact["detected_ts"] = self.now()
         self.contacts.append(contact)
 
     def remove_capability(self, vid: str, capability: str):
@@ -405,7 +658,7 @@ class PerceivedSimulator:
 
     def push_alert(self, alert: dict):
         alert = dict(alert)
-        alert.setdefault("ts", time.time())
+        alert.setdefault("ts", self.now())
         alert.setdefault("sim_time_sec", self.sim_time_sec)
         self.alerts.append(alert)
         self.alerts = self.alerts[-10:]
@@ -416,6 +669,7 @@ class PerceivedSimulator:
     def snapshot(self) -> dict:
         return {
             "vehicles": list(self.perceived.values()),
+            "mothership": self.mothership,
             "contacts": self.contacts,
             "alerts": self.alerts,
             "sim_time_sec": self.sim_time_sec,

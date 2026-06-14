@@ -19,6 +19,7 @@ POST /inject/{event_type}.
 """
 
 import time
+from perceived_sim import BINGO_PCT
 
 # Scenario A — Underwater contact lost (D4 + D1).
 SCENARIO_A = [
@@ -88,9 +89,12 @@ def apply_event(sim, event: dict):
 
     elif etype == "bingo_warning":
         vid = event["vehicle"]
-        pct = event.get("battery_pct", 20)
-        sim.set_battery(vid, pct)
-        sim.set_status(vid, "bingo")
+        _p = sim.perceived.get(vid)
+        _default_pct = BINGO_PCT.get(_p["type"], 20) if _p else 20
+        pct = event.get("battery_pct", _default_pct)
+        # Same entry point as organic bingo: sets battery+status AND starts the
+        # auto-return. push_alert=False because apply_event emits its own below.
+        sim.trigger_bingo(vid, battery_pct=pct, push_alert=False)
         desc = f"{vid} BINGO fuel — battery at {pct}%"
 
     else:
@@ -134,6 +138,13 @@ class EventScheduler:
                 apply_event(self.sim, event)
                 self._fired.add(i)
 
+    def next_event_time(self):
+        """Sim-time (sec) of the earliest event not yet fired, or None."""
+        pending = [
+            e["t_sec"] for i, e in enumerate(self.scenario) if i not in self._fired
+        ]
+        return min(pending) if pending else None
+
     def fire_by_type(self, event_type: str):
         """Manually fire the first scenario event matching a type.
 
@@ -144,6 +155,9 @@ class EventScheduler:
             if event["type"] == event_type:
                 return apply_event(self.sim, event)
 
+        _bingo_vid = "UAV-2"
+        _bingo_p = self.sim.perceived.get(_bingo_vid)
+        _bingo_pct = BINGO_PCT.get(_bingo_p["type"], 20) if _bingo_p else 20
         defaults = {
             "acoustic_loss": {"type": "acoustic_loss", "vehicle": "UUV-2"},
             "acoustic_regain": {"type": "acoustic_regain", "vehicle": "UUV-2"},
@@ -159,7 +173,7 @@ class EventScheduler:
                 "type": "sensor_failure", "vehicle": "USV-1",
                 "capability_lost": "active_sonar",
             },
-            "bingo_warning": {"type": "bingo_warning", "vehicle": "UAV-2", "battery_pct": 18},
+            "bingo_warning": {"type": "bingo_warning", "vehicle": _bingo_vid, "battery_pct": _bingo_pct},
         }
         event = defaults.get(event_type)
         if event:
