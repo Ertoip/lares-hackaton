@@ -82,6 +82,10 @@ KN_TO_MPS = 0.514444
 DRIFT_DEG_PER_MIN = 6.0     # how fast the heading-drift half-angle accumulates
 MAX_DRIFT_DEG = 45.0        # ceiling on the heading-drift half-angle
 
+# Inertial-navigation fallback (GPS jamming): sigma grows at this rate with no
+# external fix, reflecting accumulated IMU drift (~50 m/min per scenario brief).
+GPS_JAMMING_DRIFT_M_PER_MIN = 50.0
+
 # Operating-area box (Dover Strait).
 LAT_MIN, LAT_MAX = 50.85, 51.25
 LON_MIN, LON_MAX = 0.90, 2.20
@@ -416,7 +420,7 @@ class PerceivedSimulator:
         p_drop = drop_probability(
             p["link_type"], sea_val, p.get("z_m", 0.0), p.get("submerged", False)
         )
-        if random.random() >= p_drop:
+        if random.random() >= p_drop and not p.get("gps_jammed"):
             self._advance_fix(p, now)  # contact received -> new anchor, sigma resets
 
     def _advance_fix(self, p, now):
@@ -505,12 +509,18 @@ class PerceivedSimulator:
         link = p["link_type"]
         base = base_sigma_m(link)
         age_min = age / 60.0
-        # Along-track (forward/back): speed/timing uncertainty, grows with time.
-        sigma_along = base + sigma_growth_m_per_min(link) * age_min
-        # Cross-track (sideways): heading drift over the distance travelled.
-        dist_m = p["fix_speed_knots"] * KN_TO_MPS * age
-        drift = math.radians(min(MAX_DRIFT_DEG, DRIFT_DEG_PER_MIN * age_min))
-        sigma_cross = base + dist_m * math.tan(drift)
+        if p.get("gps_jammed"):
+            # Inertial navigation: sigma grows isotropically at the IMU drift rate;
+            # no GPS fix means no anchor reset, so uncertainty is purely time-driven.
+            sigma_along = base + GPS_JAMMING_DRIFT_M_PER_MIN * age_min
+            sigma_cross = sigma_along
+        else:
+            # Along-track (forward/back): speed/timing uncertainty, grows with time.
+            sigma_along = base + sigma_growth_m_per_min(link) * age_min
+            # Cross-track (sideways): heading drift over the distance travelled.
+            dist_m = p["fix_speed_knots"] * KN_TO_MPS * age
+            drift = math.radians(min(MAX_DRIFT_DEG, DRIFT_DEG_PER_MIN * age_min))
+            sigma_cross = base + dist_m * math.tan(drift)
         p["sigma_along_m"] = round(sigma_along, 1)
         p["sigma_cross_m"] = round(sigma_cross, 1)
         p["uncertainty_heading_deg"] = p["heading"]  # ellipse major axis = heading
@@ -634,6 +644,30 @@ class PerceivedSimulator:
                 p["sensor_health"][capability] = 0.0
             if p["status"] == "nominal":
                 p["status"] = "degraded"
+
+    def start_gps_jamming(self, vid: str):
+        """Switch vehicle to inertial-navigation fallback (GPS denied).
+
+        Freezes GPS fix arrival so sigma grows at GPS_JAMMING_DRIFT_M_PER_MIN
+        (~50 m/min per scenario brief). The last good GPS fix becomes the
+        dead-reckoning anchor; position uncertainty grows from that moment.
+        """
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        p["gps_jammed"] = True
+        if p["status"] == "nominal":
+            p["status"] = "degraded"
+
+    def stop_gps_jamming(self, vid: str):
+        """Restore GPS — next comms cycle will deliver a fresh fix and reset sigma."""
+        p = self.perceived.get(vid)
+        if not p:
+            return
+        p["gps_jammed"] = False
+        if p["status"] == "degraded":
+            p["status"] = "nominal"
+        p["last_contact_ts"] = self.now()  # treat GPS re-acquisition as a new fix
 
     def set_status(self, vid: str, status: str):
         p = self.perceived.get(vid)

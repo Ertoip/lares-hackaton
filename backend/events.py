@@ -5,7 +5,7 @@ simulation start. A background loop (driven from main.py) watches the sim
 clock and applies each event to the Simulator as its time arrives. Timings
 follow §4 of the challenge brief.
 
-Two scenarios are scripted:
+Three scenarios are scripted:
 
   * SCENARIO_A — Underwater contact lost. UUV-1 loses its acoustic link 18 min
     in (turbidity + ambient noise), with ~25 min of blackout before the next
@@ -13,13 +13,19 @@ Two scenarios are scripted:
   * SCENARIO_B — Threat appears + vehicle damaged. A fast, dark (no-AIS) contact
     pops up at minute 22; two minutes later USV-2 takes a debris impact and
     loses passive sonar.  Decision classes D3 + D1 + D2.
+  * SCENARIO_C — Local GPS jamming. At minute 30 a jamming source degrades GPS
+    for UAV-1, UAV-2, and USV-1 (same sector). All three fall back to inertial
+    navigation; position uncertainty grows at ~50 m/min. Jamming lifts at
+    minute 50.  Decision classes D2 + D1.
 
 Each event is also addressable by `type`, so the UI can fire one manually via
 POST /inject/{event_type}.
 """
 
+import math
 import time
 from perceived_sim import BINGO_PCT
+import random
 
 # Scenario A — Underwater contact lost (D4 + D1).
 SCENARIO_A = [
@@ -29,13 +35,15 @@ SCENARIO_A = [
 ]
 
 # Scenario B — Threat appears + vehicle damaged (D3 + D1 + D2).
+# lat/lon omitted from threat_contact — apply_event resolves them at fire time
+# relative to USV-1's position so the target spawns near the scout drone.
 SCENARIO_B = [
     {"t_sec": 0, "type": "sim_start"},
     {
         "t_sec": 1320,  # 22 min
         "type": "threat_contact",
         "contact": {
-            "id": "TGT-01", "lat": 51.06, "lon": 1.65,
+            "id": "TGT-01",
             "speed_knots": 28, "heading": 210, "ais": False,
             "behavior": "hostile",
         },
@@ -48,10 +56,27 @@ SCENARIO_B = [
     },
 ]
 
+# Scenario C — Local GPS jamming (D2 + D1).
+# UAV-1, UAV-2, USV-1 share a sector; jamming drives all three to inertial nav
+# with ~50 m/min drift. Jamming lifts at minute 50, GPS re-acquired.
+_GPS_JAMMED = ["UAV-1", "UAV-2", "USV-1"]
+SCENARIO_C = [
+    {"t_sec": 0, "type": "sim_start"},
+    *[
+        {"t_sec": 1800, "type": "gps_jamming_start", "vehicle": vid}
+        for vid in _GPS_JAMMED
+    ],
+    *[
+        {"t_sec": 3000, "type": "gps_jamming_end", "vehicle": vid}
+        for vid in _GPS_JAMMED
+    ],
+]
+
 # Selectable by name from main.py / a REST endpoint.
 SCENARIOS = {
     "A": SCENARIO_A,
     "B": SCENARIO_B,
+    "C": SCENARIO_C,
 }
 
 
@@ -77,7 +102,18 @@ def apply_event(sim, event: dict):
         desc = f"{vid} surfaced — acoustic link re-established"
 
     elif etype == "threat_contact":
-        contact = event["contact"]
+        contact = dict(event["contact"])
+        if "lat" not in contact or "lon" not in contact:
+            from geo import snap_to_water
+            anchor = sim.perceived.get("USV-1") or {}
+            base_lat = anchor.get("lat", 51.10)
+            base_lon = anchor.get("lon", 1.55)
+            # random bearing and radius 3–8 km (≈0.027–0.072° at 51°N)
+            angle_rad = random.uniform(0, 2 * math.pi)
+            radius_deg = random.uniform(0.027, 0.072)
+            raw_lat = base_lat + radius_deg * math.cos(angle_rad)
+            raw_lon = base_lon + radius_deg * math.sin(angle_rad)
+            contact["lat"], contact["lon"] = snap_to_water(raw_lat, raw_lon)
         sim.add_contact(contact)
         desc = f"Threat contact {contact.get('id')} detected ({contact.get('behavior')})"
 
@@ -86,6 +122,16 @@ def apply_event(sim, event: dict):
         cap = event.get("capability_lost")
         sim.remove_capability(vid, cap)
         desc = f"{vid} sensor failure — lost {cap}"
+
+    elif etype == "gps_jamming_start":
+        vid = event["vehicle"]
+        sim.start_gps_jamming(vid)
+        desc = f"{vid} GPS denied — falling back to inertial navigation (~50 m/min drift)"
+
+    elif etype == "gps_jamming_end":
+        vid = event["vehicle"]
+        sim.stop_gps_jamming(vid)
+        desc = f"{vid} GPS re-acquired — position uncertainty reset"
 
     elif etype == "bingo_warning":
         vid = event["vehicle"]
@@ -174,6 +220,8 @@ class EventScheduler:
                 "capability_lost": "active_sonar",
             },
             "bingo_warning": {"type": "bingo_warning", "vehicle": _bingo_vid, "battery_pct": _bingo_pct},
+            "gps_jamming_start": {"type": "gps_jamming_start", "vehicle": "UAV-1"},
+            "gps_jamming_end": {"type": "gps_jamming_end", "vehicle": "UAV-1"},
         }
         event = defaults.get(event_type)
         if event:
