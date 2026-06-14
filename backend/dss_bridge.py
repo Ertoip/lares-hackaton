@@ -77,8 +77,9 @@ DSS_ID = {
     "UAV-1": "air_1", "UAV-2": "air_2",
     "USV-1": "surface_1", "USV-2": "surface_2",
     "UUV-1": "sub_1", "UUV-2": "sub_2",
+    "CSV MERIDIAN": "mothership_1",
 }
-DOMAIN_BY_TYPE = {"UAV": "air", "USV": "surface", "UUV": "subsurface"}
+DOMAIN_BY_TYPE = {"UAV": "air", "USV": "surface", "UUV": "subsurface", "mothership": "surface"}
 # link_type -> DSS communication_mode (radio/acoustic/satellite/cellular).
 COMM_MODE = {"radio": "radio", "satellite": "satellite", "acoustic": "acoustic"}
 # DSS requires this exact value per domain in every heartbeat.
@@ -238,12 +239,40 @@ def build_telemetry(p: dict, dss_id: str, domain: str) -> dict:
         "timestamp": _iso_now(),
         "domain": domain,
         "status": _map_status(p),
+        "lat": round(p["lat"], 6),
+        "lon": round(p["lon"], 6),
         "position": _position(p, domain),
         "velocity": _velocity(p),
         "battery": _battery(p),
         "sensors": _sensors(p),
         "capabilities": _capabilities(p),
         "current_task_id": p.get("current_task"),
+    }
+
+
+def build_mothership_telemetry(m: dict) -> dict:
+    """Telemetry for the crewed command vessel (always surface, always known position)."""
+    heading = round((m.get("heading", 0.0) or 0.0) % 360, 1)
+    return {
+        "message_type": "telemetry",
+        "vehicle_id": "mothership_1",
+        "timestamp": _iso_now(),
+        "domain": "surface",
+        "status": "active",
+        "lat": round(m["lat"], 6),
+        "lon": round(m["lon"], 6),
+        "position": {"lat": round(m["lat"], 6), "lon": round(m["lon"], 6), "alt": None, "depth": None},
+        "velocity": {
+            "speed_mps": round((m.get("speed_knots", 0.0) or 0.0) * KN_TO_MPS, 3),
+            "heading_deg": heading,
+        },
+        "battery": None,
+        "sensors": {},
+        "capabilities": {
+            "visual_isr": False, "radar_scan": False,
+            "sonar_scan": False, "relay_comms": True,
+        },
+        "current_task_id": None,
     }
 
 
@@ -412,6 +441,11 @@ async def process_snapshot(snap: dict, dss, state: BridgeState):
             state.last_hb[dss_id] = mono
 
         await _send(dss, build_telemetry(p, dss_id, domain), "telemetry")
+
+    # Mothership (crewed command vessel) — always online, send every snapshot.
+    m = snap.get("mothership")
+    if m and m.get("lat") is not None and m.get("lon") is not None:
+        await _send(dss, build_mothership_telemetry(m), "telemetry/mothership")
 
     # Threat contacts -> events (once per id).
     for c in snap.get("contacts", []):
